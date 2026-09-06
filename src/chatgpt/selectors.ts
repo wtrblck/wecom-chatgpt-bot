@@ -36,6 +36,18 @@ export function findSendButton(page: Page): Locator {
   return union(page, SEND_SELECTORS).filter({ visible: true }).first();
 }
 
+export function findFileInput(page: Page): Locator {
+  return page.locator('input[type="file"]').first();
+}
+
+export function findAttachButton(page: Page): Locator {
+  return page
+    .getByRole('button', { name: /attach|add photos|upload|附件|上传|添加照片/i })
+    .or(page.locator('button[data-testid*="attach"], button[aria-label*="附件"], button[aria-label*="上传"]'))
+    .filter({ visible: true })
+    .first();
+}
+
 export function findStopButton(page: Page): Locator {
   return union(page, STOP_SELECTORS).filter({ visible: true }).first();
 }

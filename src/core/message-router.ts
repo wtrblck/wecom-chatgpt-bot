@@ -51,7 +51,7 @@ export class MessageRouter {
     }
     if (message.displayName) this.repository.saveContact(message.platform, message.userId, message.displayName);
 
-    const text = this.applyPolicy(message.platform, message.userId, message.text);
+    const text = this.applyPolicy(message.platform, message.userId, message.text, message.triggerPrefixes);
     if (text === null || !text) {
       this.logger.debug({ component: 'router', event: 'policy_filtered', platform: message.platform, userid: message.userId }, '消息被渠道策略过滤');
       return;
@@ -66,15 +66,23 @@ export class MessageRouter {
     await this.enqueuePrompt({ ...context, message: normalized }, text, false);
   }
 
-  private applyPolicy(platform: 'wecom' | 'wechat', userId: string, text: string): string | null {
+  private applyPolicy(
+    platform: 'wecom' | 'wechat',
+    userId: string,
+    text: string,
+    messagePrefixes?: readonly string[],
+  ): string | null {
     const policy = this.options.policies?.[platform];
     if (policy?.allowlist?.size && !policy.allowlist.has(userId)) return null;
     if (!policy?.requirePrefix) return text.trim();
     const trimmed = text.trim();
-    const prefixes = policy.prefixes?.length ? policy.prefixes : [policy.prefix || '/gpt'];
+    const prefixes = messagePrefixes?.length
+      ? messagePrefixes
+      : policy.prefixes?.length ? policy.prefixes : [policy.prefix || '/gpt'];
+    if (prefixes.includes('')) return trimmed;
     const matched = prefixes.find((prefix) => {
       const candidate = trimmed.slice(0, prefix.length);
-      return candidate.localeCompare(prefix, undefined, { sensitivity: 'accent' }) === 0
+      return candidate === prefix
         && (trimmed.length === prefix.length || /^\s/u.test(trimmed.slice(prefix.length)));
     });
     if (!matched) return null;
@@ -108,7 +116,12 @@ export class MessageRouter {
           await this.browser.loadConversation(this.conversations.get(conversationKey));
           const result = useRetry
             ? await this.browser.retryLast(browserPrompt, (text) => reply.update(text), signal)
-            : await this.browser.generate(browserPrompt, (text) => reply.update(text), signal);
+            : await this.browser.generate(
+                browserPrompt,
+                (text) => reply.update(text),
+                signal,
+                message.attachments?.map((attachment) => attachment.path) ?? [],
+              );
           this.conversations.save(conversationKey, result.conversationUrl);
           await reply.finish(result.text);
           this.repository.updateTask(taskId, 'completed', { response: result.text });

@@ -13,6 +13,10 @@ export interface BridgeIncomingMessage {
   text: string;
   timestamp: number;
   isSelf: boolean;
+  sortSeq?: number;
+  kind?: 'text' | 'image' | 'sticker' | 'link';
+  localId?: number;
+  attachmentPath?: string;
 }
 
 export interface BridgeState {

@@ -24,6 +24,7 @@ vendor/wechatauto-replica/*
 !vendor/wechatauto-replica/wechatauto/
 vendor/wechatauto-replica/wechatauto/*
 !vendor/wechatauto-replica/wechatauto/db.py
+!vendor/wechatauto-replica/wechatauto/media.py
 .dotnet-home/
 coverage/
 playwright-report/

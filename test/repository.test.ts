@@ -28,6 +28,11 @@ describe('Repository', () => {
     const id = repository.createTask('m2', 'u1', 'hello');
     repository.updateTask(id, 'running');
     expect(repository.abortInterruptedTasks()).toBe(1);
+    expect(repository.wasWechatMessageSubmitted('group@chatroom', 'context-1')).toBe(false);
+    repository.markWechatContextSubmitted('group@chatroom', ['context-1', 'context-2']);
+    expect(repository.wasWechatMessageSubmitted('group@chatroom', 'context-1')).toBe(true);
+    repository.createTask('wechat:question-1', 'wechat:group@chatroom', 'question');
+    expect(repository.wasWechatMessageSubmitted('group@chatroom', 'question-1')).toBe(true);
     db.close();
   });
 });

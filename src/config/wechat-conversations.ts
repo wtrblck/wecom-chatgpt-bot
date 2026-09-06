@@ -8,6 +8,7 @@ export interface WeChatConversationConfig {
   id?: string;
   enabled: boolean;
   systemPrompt?: string;
+  prefixes?: string[];
 }
 
 interface ConversationFile {
@@ -27,6 +28,23 @@ export function parseWechatConversations(value: unknown): WeChatConversationConf
     const type = item.type;
     const id = typeof item.id === 'string' ? item.id.trim() : '';
     const systemPrompt = typeof item.systemPrompt === 'string' ? item.systemPrompt.trim() : '';
+    if (item.prefixes !== undefined && !Array.isArray(item.prefixes)) {
+      throw new Error(`conversations[${index}].prefixes 必须是字符串数组`);
+    }
+    const prefixes = Array.isArray(item.prefixes)
+      ? item.prefixes.map((prefix, prefixIndex) => {
+          if (typeof prefix !== 'string') {
+            throw new Error(`conversations[${index}].prefixes[${prefixIndex}] 必须是字符串`);
+          }
+          return prefix.trim();
+        })
+      : undefined;
+    if (prefixes?.length === 0) {
+      throw new Error(`conversations[${index}].prefixes 至少要包含一个前缀`);
+    }
+    if (prefixes && new Set(prefixes).size !== prefixes.length) {
+      throw new Error(`conversations[${index}].prefixes 不能包含重复值`);
+    }
     if (!name) throw new Error(`conversations[${index}].name 不能为空`);
     if (type !== 'group' && type !== 'contact') {
       throw new Error(`conversations[${index}].type 只能是 group 或 contact`);
@@ -43,8 +61,21 @@ export function parseWechatConversations(value: unknown): WeChatConversationConf
       ...(id ? { id } : {}),
       enabled: item.enabled !== false,
       ...(systemPrompt ? { systemPrompt } : {}),
+      ...(prefixes ? { prefixes } : {}),
     };
   });
+}
+
+export function resolveWechatPrefixes(
+  conversations: readonly WeChatConversationConfig[],
+  userId: string,
+  displayName: string | undefined,
+  fallback: readonly string[],
+): readonly string[] {
+  const enabled = conversations.filter((item) => item.enabled);
+  const matched = enabled.find((item) => item.id === userId)
+    ?? enabled.find((item) => item.name === displayName);
+  return matched?.prefixes ?? fallback;
 }
 
 export function loadWechatConversations(filePath: string): WeChatConversationConfig[] | null {

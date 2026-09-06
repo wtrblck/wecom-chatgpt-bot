@@ -109,6 +109,7 @@ internal sealed class WeChatAutomation
         var processes = FindProcesses();
         var window = FindWindow(processes);
         if (window is null) return new(processes.Count > 0, false, false, null, "请启动 Windows 官方微信客户端并完成登录");
+        window = EnsureAccessibility(window, out var accessibility);
         var title = Safe(() => window.Current.Name) ?? string.Empty;
         var rect = SafeRect(window);
         var descendants = FindDescendants(window).Cast<AutomationElement>().ToList();
@@ -117,8 +118,8 @@ internal sealed class WeChatAutomation
         var explicitLogin = Regex.IsMatch(title, "登录|login", RegexOptions.IgnoreCase);
         var loggedIn = !explicitLogin && (exposedControls || mainWindowSize);
         var detail = loggedIn
-            ? $"ready; size={(int)rect.Width}x{(int)rect.Height}; accessible_elements={descendants.Count}"
-            : $"微信窗口存在，但尚未检测到已登录聊天界面; size={(int)rect.Width}x{(int)rect.Height}; accessible_elements={descendants.Count}";
+            ? $"ready; size={(int)rect.Width}x{(int)rect.Height}; accessible_elements={descendants.Count}; accessibility={accessibility}"
+            : $"微信窗口存在，但尚未检测到已登录聊天界面; size={(int)rect.Width}x{(int)rect.Height}; accessible_elements={descendants.Count}; accessibility={accessibility}";
         return new(true, true, loggedIn, title, detail);
     }
 
@@ -186,11 +187,29 @@ internal sealed class WeChatAutomation
     public void Send(string displayName, string text)
     {
         var root = RequireLoggedInWindow();
-        if (!FindDescendants(root).Cast<AutomationElement>().Any(IsConversationOrEditor))
+        Exception? accessibilityError = null;
+        if (FindDescendants(root).Cast<AutomationElement>().Any(IsConversationOrEditor))
         {
-            WeChatVision.Send(root, displayName, text, CaptureBitmap, Click);
-            return;
+            try
+            {
+                SendAccessible(root, displayName, text);
+                return;
+            }
+            catch (Exception error)
+            {
+                accessibilityError = error;
+            }
         }
+        try { WeChatVision.Send(root, displayName, text, CaptureBitmap, Click); }
+        catch (Exception visualError) when (accessibilityError is not null)
+        {
+            throw new InvalidOperationException(
+                $"微信 UIA 发送失败: {accessibilityError.Message}; 视觉后备失败: {visualError.Message}", visualError);
+        }
+    }
+
+    private static void SendAccessible(AutomationElement root, string displayName, string text)
+    {
         var conversation = FindConversation(root, displayName);
         if (conversation is not null)
         {
@@ -201,12 +220,20 @@ internal sealed class WeChatAutomation
             var search = FindSearchEditor(root)
                 ?? throw new InvalidOperationException("找不到微信搜索框，可能需要更新 UI 定位规则");
             SetText(search, displayName);
-            Thread.Sleep(250);
-            SendKeys.SendWait("{ENTER}");
+            Thread.Sleep(500);
+            var searchResult = FindSearchResult(root, displayName)
+                ?? throw new InvalidOperationException($"微信搜索结果中找不到精确会话: {displayName}");
+            Activate(searchResult);
         }
         Thread.Sleep(250);
         var editor = FindChatEditor(root)
             ?? throw new InvalidOperationException("找不到微信聊天输入框，可能需要更新 UI 定位规则");
+        var editorName = Safe(() => editor.Current.Name) ?? string.Empty;
+        var editorAutomationId = Safe(() => editor.Current.AutomationId) ?? string.Empty;
+        if (string.Equals(editorAutomationId, "chat_input_field", StringComparison.OrdinalIgnoreCase)
+            && !string.IsNullOrWhiteSpace(editorName)
+            && !ConversationNamesMatch(editorName, displayName))
+            throw new InvalidOperationException($"微信目标会话校验失败，期望 {displayName}，实际 {editorName}");
         SetText(editor, text);
         SendKeys.SendWait("{ENTER}");
     }
@@ -234,7 +261,7 @@ internal sealed class WeChatAutomation
 
     private static Bitmap CaptureBitmap(AutomationElement root)
     {
-        var rect = root.Current.BoundingRectangle;
+        var rect = GetWindowBounds(root);
         if (rect.IsEmpty || rect.Width <= 0 || rect.Height <= 0) throw new InvalidOperationException("微信窗口尺寸无效");
         var bitmap = new Bitmap((int)rect.Width, (int)rect.Height);
         using var graphics = Graphics.FromImage(bitmap);
@@ -249,12 +276,26 @@ internal sealed class WeChatAutomation
 
     private static Bitmap CaptureScreenBitmap(AutomationElement root)
     {
-        var rect = root.Current.BoundingRectangle;
+        var rect = GetWindowBounds(root);
         if (rect.IsEmpty || rect.Width <= 0 || rect.Height <= 0) throw new InvalidOperationException("微信窗口尺寸无效");
         var bitmap = new Bitmap((int)rect.Width, (int)rect.Height);
         using var graphics = Graphics.FromImage(bitmap);
         graphics.CopyFromScreen((int)rect.Left, (int)rect.Top, 0, 0, bitmap.Size);
         return bitmap;
+    }
+
+    private static Rect GetWindowBounds(AutomationElement root)
+    {
+        var handleValue = Safe(() => root.Current.NativeWindowHandle);
+        var handle = new IntPtr(handleValue);
+        if (handle != IntPtr.Zero && GetWindowRect(handle, out var nativeRect))
+        {
+            var width = nativeRect.Right - nativeRect.Left;
+            var height = nativeRect.Bottom - nativeRect.Top;
+            if (width > 0 && height > 0)
+                return new Rect(nativeRect.Left, nativeRect.Top, width, height);
+        }
+        return SafeRect(root);
     }
 
     private static List<Process> FindProcesses() => ProcessNames
@@ -267,20 +308,22 @@ internal sealed class WeChatAutomation
         var processList = processes.ToList();
         var candidates = new List<AutomationElement>();
         var handles = new HashSet<IntPtr>();
-        foreach (var process in processList)
+        void AddCandidate(IntPtr handle, bool requireUsableSize)
         {
-            if (process.MainWindowHandle == IntPtr.Zero) continue;
-            var element = Safe(() => AutomationElement.FromHandle(process.MainWindowHandle));
-            if (element is not null && handles.Add(process.MainWindowHandle)) candidates.Add(element);
+            if (handle == IntPtr.Zero || handles.Contains(handle) || !IsWindowVisible(handle)) return;
+            if (!GetWindowRect(handle, out var rect)) return;
+            if (requireUsableSize && (rect.Right - rect.Left < 240 || rect.Bottom - rect.Top < 240)) return;
+            var element = Safe(() => AutomationElement.FromHandle(handle));
+            if (element is not null && handles.Add(handle)) candidates.Add(element);
         }
+        foreach (var process in processList)
+            AddCandidate(process.MainWindowHandle, false);
         var processIds = processList.Select(item => (uint)item.Id).ToHashSet();
         EnumWindows((handle, _) =>
         {
             GetWindowThreadProcessId(handle, out var processId);
-            if (!processIds.Contains(processId) || !IsWindowVisible(handle)) return true;
-            if (!GetWindowRect(handle, out var rect) || rect.Right - rect.Left < 240 || rect.Bottom - rect.Top < 240) return true;
-            var element = Safe(() => AutomationElement.FromHandle(handle));
-            if (element is not null && handles.Add(handle)) candidates.Add(element);
+            if (!processIds.Contains(processId)) return true;
+            AddCandidate(handle, true);
             return true;
         }, IntPtr.Zero);
         return candidates
@@ -297,10 +340,24 @@ internal sealed class WeChatAutomation
     {
         var processes = FindProcesses();
         var window = FindWindow(processes) ?? throw new InvalidOperationException("未找到 Windows 官方微信主窗口");
+        window = EnsureAccessibility(window, out _);
         var title = Safe(() => window.Current.Name) ?? string.Empty;
         if (Regex.IsMatch(title, "登录|login", RegexOptions.IgnoreCase))
             throw new InvalidOperationException("微信客户端尚未登录");
         return window;
+    }
+
+    private static AutomationElement EnsureAccessibility(AutomationElement window, out string detail)
+    {
+        var descendants = Safe(() => FindDescendants(window).Cast<AutomationElement>().ToList()) ?? [];
+        if (descendants.Any(IsConversationOrEditor))
+        {
+            detail = "already_available";
+            return window;
+        }
+        if (!QtAccessibilityActivator.TryActivate(window, out detail)) return window;
+        Thread.Sleep(300);
+        return FindWindow(FindProcesses()) ?? window;
     }
 
     private static AutomationElementCollection FindDescendants(AutomationElement root) =>
@@ -331,7 +388,12 @@ internal sealed class WeChatAutomation
     private static AutomationElement? FindConversation(AutomationElement root, string displayName)
     {
         var rootRect = root.Current.BoundingRectangle;
-        return FindDescendants(root).Cast<AutomationElement>().FirstOrDefault(element =>
+        var descendants = FindDescendants(root).Cast<AutomationElement>().ToList();
+        var expectedAutomationId = $"session_item_{displayName}";
+        var exact = descendants.FirstOrDefault(element => string.Equals(
+            Safe(() => element.Current.AutomationId), expectedAutomationId, StringComparison.OrdinalIgnoreCase));
+        if (exact is not null) return exact;
+        return descendants.FirstOrDefault(element =>
         {
             var type = Safe(() => element.Current.ControlType);
             var rect = SafeRect(element);
@@ -358,6 +420,19 @@ internal sealed class WeChatAutomation
             .FirstOrDefault();
     }
 
+    private static AutomationElement? FindSearchResult(AutomationElement root, string displayName)
+    {
+        return FindDescendants(root).Cast<AutomationElement>()
+            .Where(element => (Safe(() => element.Current.AutomationId) ?? string.Empty)
+                .StartsWith("search_item_", StringComparison.OrdinalIgnoreCase))
+            .FirstOrDefault(element =>
+            {
+                var name = Safe(() => element.Current.Name) ?? string.Empty;
+                return ConversationNamesMatch(name, displayName)
+                    || ConversationNamesMatch(GetConversationDisplayName(element), displayName);
+            });
+    }
+
     private static AutomationElement? FindChatEditor(AutomationElement root)
     {
         var rootRect = root.Current.BoundingRectangle;
@@ -371,7 +446,9 @@ internal sealed class WeChatAutomation
                     && rect.Left > rootRect.Left + rootRect.Width * 0.25
                     && rect.Top > rootRect.Top + rootRect.Height * 0.5;
             })
-            .OrderByDescending(element =>
+            .OrderByDescending(element => string.Equals(
+                Safe(() => element.Current.AutomationId), "chat_input_field", StringComparison.OrdinalIgnoreCase))
+            .ThenByDescending(element =>
             {
                 var rect = element.Current.BoundingRectangle;
                 return rect.Width * rect.Height;
@@ -418,10 +495,17 @@ internal sealed class WeChatAutomation
 
     private static void Activate(AutomationElement element)
     {
-        if (element.TryGetCurrentPattern(SelectionItemPattern.Pattern, out var selection))
-            ((SelectionItemPattern)selection).Select();
+        var automationId = Safe(() => element.Current.AutomationId) ?? string.Empty;
+        if (automationId.StartsWith("session_item_", StringComparison.OrdinalIgnoreCase)
+            || automationId.StartsWith("search_item_", StringComparison.OrdinalIgnoreCase))
+        {
+            var rect = element.Current.BoundingRectangle;
+            Click((int)(rect.Left + rect.Width / 2), (int)(rect.Top + rect.Height / 2));
+        }
         else if (element.TryGetCurrentPattern(InvokePattern.Pattern, out var invoke))
             ((InvokePattern)invoke).Invoke();
+        else if (element.TryGetCurrentPattern(SelectionItemPattern.Pattern, out var selection))
+            ((SelectionItemPattern)selection).Select();
         else
         {
             var rect = element.Current.BoundingRectangle;
@@ -437,8 +521,19 @@ internal sealed class WeChatAutomation
         else
         {
             SendKeys.SendWait("^a");
-            SendKeys.SendWait(EscapeSendKeys(text));
+            System.Windows.Forms.Clipboard.SetText(text);
+            SendKeys.SendWait("^v");
         }
+    }
+
+    private static bool ConversationNamesMatch(string actual, string expected)
+    {
+        static string NormalizeName(string value) => new(value.Trim().Where(character => !char.IsWhiteSpace(character)).ToArray());
+        var left = NormalizeName(actual);
+        var right = NormalizeName(expected);
+        return left.Equals(right, StringComparison.OrdinalIgnoreCase)
+            || left.Contains(right, StringComparison.OrdinalIgnoreCase)
+            || right.Contains(left, StringComparison.OrdinalIgnoreCase);
     }
 
     private static string CleanConversationName(string value)

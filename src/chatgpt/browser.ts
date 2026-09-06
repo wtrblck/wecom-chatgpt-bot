@@ -14,10 +14,12 @@ import {
 } from './errors.js';
 import {
   findAssistantMessages,
+  findAttachButton,
   findAuthenticatedUi,
   findConversationUi,
   findLoginControls,
   findPromptEditor,
+  findFileInput,
   findRegenerateButton,
   findSendButton,
   findStopButton,
@@ -136,6 +138,7 @@ export class ChatGPTBrowser {
     prompt: string,
     onUpdate: (text: string) => Promise<void>,
     signal?: AbortSignal,
+    attachmentPaths: readonly string[] = [],
   ): Promise<{ text: string; conversationUrl: string }> {
     await this.assertReady();
     const page = this.requirePage();
@@ -146,7 +149,7 @@ export class ChatGPTBrowser {
         ? (await findAssistantMessages(page).last().innerText().catch(() => '')).trim()
         : '';
       try {
-        await this.sendMessage(prompt, signal);
+        await this.sendMessage(prompt, signal, attachmentPaths);
       } catch (error) {
         if (!(await findPromptEditor(page).isVisible().catch(() => false))) {
           await this.captureDomError('prompt-editor-missing');
@@ -208,10 +211,15 @@ export class ChatGPTBrowser {
     return true;
   }
 
-  private async sendMessage(text: string, signal?: AbortSignal): Promise<void> {
+  private async sendMessage(
+    text: string,
+    signal?: AbortSignal,
+    attachmentPaths: readonly string[] = [],
+  ): Promise<void> {
     const page = this.requirePage();
     if (signal?.aborted) throw new ChatGPTGenerationStoppedError('generation stopped');
     const oldUserCount = await findUserMessages(page).count();
+    await this.uploadAttachments(attachmentPaths, signal);
     await retry(async () => {
       if (await findStopButton(page).isVisible().catch(() => false)) throw new ChatGPTSendError('上一次生成尚未结束');
       const editor = findPromptEditor(page);
@@ -228,6 +236,28 @@ export class ChatGPTBrowser {
     }, 2, 700).catch((error) => {
       throw new ChatGPTSendError(error instanceof Error ? error.message : String(error));
     });
+  }
+
+  private async uploadAttachments(paths: readonly string[], signal?: AbortSignal): Promise<void> {
+    if (paths.length === 0) return;
+    if (paths.length > 10) throw new ChatGPTSendError('单次上下文图片不能超过 10 张');
+    if (signal?.aborted) throw new ChatGPTGenerationStoppedError('generation stopped');
+    await Promise.all(paths.map((filePath) => fs.access(filePath)));
+    const page = this.requirePage();
+    const input = findFileInput(page);
+    if (await input.count()) {
+      await input.setInputFiles([...paths]);
+    } else {
+      const attach = findAttachButton(page);
+      await attach.waitFor({ state: 'visible', timeout: 10_000 });
+      const chooserPromise = page.waitForEvent('filechooser', { timeout: 10_000 });
+      await attach.click();
+      const chooser = await chooserPromise;
+      await chooser.setFiles([...paths]);
+    }
+    // Attachment previews are rendered asynchronously and image-only previews do
+    // not consistently expose filenames. Wait for the draft to settle before send.
+    await page.waitForTimeout(1_000);
   }
 
   private async refreshLoginState(): Promise<void> {

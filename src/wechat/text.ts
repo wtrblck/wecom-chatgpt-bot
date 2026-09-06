@@ -33,6 +33,54 @@ export function normalizeWechatDatabaseText(userId: string, text: string): strin
   return groupSenderEnvelope(userId, text)?.body ?? text.trim();
 }
 
+export interface WeChatPromptContext {
+  messageId: string;
+  speaker: string;
+  text: string;
+}
+
+export function selectIncrementalWechatContext<T extends { messageId: string }>(
+  messagesNewestFirst: readonly T[],
+  wasSubmitted: (messageId: string) => boolean,
+  maximum = 10,
+): T[] {
+  const previousSubmission = messagesNewestFirst.findIndex((message) => wasSubmitted(message.messageId));
+  const sincePreviousSubmission = previousSubmission >= 0
+    ? messagesNewestFirst.slice(0, previousSubmission)
+    : messagesNewestFirst;
+  return sincePreviousSubmission.slice(0, maximum).reverse();
+}
+
+export function matchWechatPrefix(text: string, prefixes: readonly string[]): { prefix: string; body: string } | null {
+  const trimmed = text.trim();
+  const prefix = prefixes.find((item) => {
+    const candidate = trimmed.slice(0, item.length);
+    return candidate === item
+      && (trimmed.length === item.length || /^\s/u.test(trimmed.slice(item.length)));
+  });
+  return prefix ? { prefix, body: trimmed.slice(prefix.length).trim() } : null;
+}
+
+export function addWechatGroupContext(
+  originalText: string,
+  prefixes: readonly string[],
+  currentSpeaker: string,
+  messages: readonly WeChatPromptContext[],
+  preservePrefix: boolean,
+): string {
+  const match = matchWechatPrefix(originalText, prefixes);
+  if (!match || messages.length === 0) return originalText;
+  const history = messages.map((message, index) => `${index + 1}. ${message.speaker}：${message.text}`).join('\n');
+  const prompt = [
+    '【本次提问前的群聊上下文（按时间顺序）】',
+    '接着前一次的消息',
+    history,
+    '【本次提问】',
+    `${currentSpeaker}：${match.body}`,
+  ].join('\n\n');
+  return preservePrefix ? `${match.prefix}\n\n${prompt}` : prompt;
+}
+
 export function splitWechatText(text: string, maxCharacters = 1_800): string[] {
   const result: string[] = [];
   let rest = text.trim();

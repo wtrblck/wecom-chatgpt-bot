@@ -39,6 +39,31 @@ export class Repository {
     return row?.display_name ?? null;
   }
 
+  wasWechatMessageSubmitted(userId: string, messageId: string): boolean {
+    const row = this.db.prepare(`
+      SELECT 1 FROM wechat_context_messages
+      WHERE conversation_id = ? AND message_id = ?
+      UNION ALL
+      SELECT 1 FROM tasks
+      WHERE userid = ? AND msgid = ?
+      LIMIT 1
+    `).get(userId, messageId, `wechat:${userId}`, `wechat:${messageId}`);
+    return row !== undefined;
+  }
+
+  markWechatContextSubmitted(userId: string, messageIds: readonly string[]): void {
+    if (messageIds.length === 0) return;
+    const insert = this.db.prepare(`
+      INSERT OR IGNORE INTO wechat_context_messages(conversation_id, message_id, sent_at)
+      VALUES (?, ?, ?)
+    `);
+    const transaction = this.db.transaction((ids: readonly string[]) => {
+      const now = Date.now();
+      for (const messageId of ids) insert.run(userId, messageId, now);
+    });
+    transaction(messageIds);
+  }
+
   getConversation(userid: string): string | null {
     const row = this.db
       .prepare('SELECT chatgpt_url FROM conversations WHERE userid = ?')

@@ -47,4 +47,11 @@ export interface IncomingMessage {
   type: 'text';
   text: string;
   timestamp: number;
+  triggerPrefixes?: readonly string[];
+  attachments?: readonly IncomingAttachment[];
+}
+
+export interface IncomingAttachment {
+  path: string;
+  label: string;
 }

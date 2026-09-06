@@ -16,6 +16,16 @@ export interface WeChatDbHealth {
   conversationCount: number;
 }
 
+export interface WeChatContextMessage extends BridgeIncomingMessage {
+  sortSeq: number;
+}
+
+export interface ResolvedWeChatMedia {
+  messageId: string;
+  senderDisplayName: string;
+  attachmentPath?: string;
+}
+
 export class WeChatDbReaderClient {
   private process: ChildProcessWithoutNullStreams | null = null;
   private readonly pending = new Map<number, PendingRequest>();
@@ -68,6 +78,17 @@ export class WeChatDbReaderClient {
 
   poll(): Promise<BridgeIncomingMessage[]> {
     return this.request('poll', {}, 60_000);
+  }
+
+  context(userId: string, beforeSortSeq: number, scanLimit = 100): Promise<WeChatContextMessage[]> {
+    return this.request('context', { userId, beforeSortSeq, scanLimit }, 60_000);
+  }
+
+  resolveMedia(
+    userId: string,
+    messages: readonly Pick<WeChatContextMessage, 'messageId' | 'localId' | 'kind' | 'senderId'>[],
+  ): Promise<ResolvedWeChatMedia[]> {
+    return this.request('resolve_media', { userId, messages }, 60_000);
   }
 
   private request<T>(operation: string, payload: Record<string, unknown>, timeoutMs = 15_000): Promise<T> {

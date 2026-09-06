@@ -1,13 +1,22 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import type { Logger } from 'pino';
+import { parseCommand } from '../commands/commands.js';
 import type { WeChatConversationConfig } from '../config/wechat-conversations.js';
+import { resolveWechatPrefixes } from '../config/wechat-conversations.js';
 import type { Repository } from '../conversation/repository.js';
 import type { IncomingMessage } from '../types/index.js';
 import { WeChatBridgeClient, type BridgeState } from './bridge-client.js';
 import { WeChatDbReaderClient } from './db-reader-client.js';
 import { OutgoingQueue } from './outgoing-queue.js';
-import { extractWechatDatabaseSenderId, normalizeWechatDatabaseText, splitWechatText } from './text.js';
+import {
+  addWechatGroupContext,
+  extractWechatDatabaseSenderId,
+  matchWechatPrefix,
+  normalizeWechatDatabaseText,
+  selectIncrementalWechatContext,
+  splitWechatText,
+} from './text.js';
 import type { PersonalWeChatAdapter } from './types.js';
 
 export interface PersonalWeChatAdapterOptions {
@@ -18,6 +27,7 @@ export interface PersonalWeChatAdapterOptions {
   logDirectory: string;
   requirePrefix: boolean;
   prefixes: readonly string[];
+  fallbackPrefixes: readonly string[];
   canonicalNames: readonly string[];
   readMode: 'ocr' | 'db';
   dbPythonPath: string;
@@ -121,7 +131,13 @@ export class WindowsPersonalWeChatAdapter implements PersonalWeChatAdapter {
             this.options.canonicalNames,
           );
       for (const item of messages) {
-        const text = this.dbReader
+        const triggerPrefixes = resolveWechatPrefixes(
+          this.options.dbConversations,
+          item.userId,
+          item.displayName,
+          this.options.fallbackPrefixes,
+        );
+        let text = this.dbReader
           ? normalizeWechatDatabaseText(item.userId, item.text)
           : item.text;
         const senderId = this.dbReader
@@ -129,9 +145,65 @@ export class WindowsPersonalWeChatAdapter implements PersonalWeChatAdapter {
           : item.senderId;
         if (item.isSelf || !item.messageId || !item.userId || !text) continue;
         if (this.repository.hasIncoming('wechat', item.messageId)) continue;
+        let contextMessageIds: string[] = [];
+        let contextAttachments: Array<{ path: string; label: string }> = [];
+        const mention = item.userId.endsWith('@chatroom')
+          ? matchWechatPrefix(text, triggerPrefixes.filter((prefix) => prefix.startsWith('@')))
+          : null;
+        if (this.dbReader && mention && item.sortSeq && !parseCommand(mention.body)) {
+          const history = await this.dbReader.context(item.userId, item.sortSeq);
+          const unused = selectIncrementalWechatContext(
+            history,
+            (messageId) => this.repository.wasWechatMessageSubmitted(item.userId, messageId),
+          );
+          if (unused.length > 0) {
+            contextMessageIds = unused.map((entry) => entry.messageId);
+            const resolvedMedia = await this.dbReader.resolveMedia(
+              item.userId,
+              unused,
+            ).catch((error: unknown) => {
+              this.logger.warn({
+                component: 'wechat_db', event: 'context_media_unavailable',
+                error: error instanceof Error ? error.message : String(error),
+              }, '群聊上下文媒体解析失败，将使用文字占位');
+              return [];
+            });
+            const attachmentPathByMessage = new Map(
+              resolvedMedia
+                .filter((entry) => Boolean(entry.attachmentPath))
+                .map((entry) => [entry.messageId, entry.attachmentPath!]),
+            );
+            const senderNameByMessage = new Map(
+              resolvedMedia.map((entry) => [entry.messageId, entry.senderDisplayName]),
+            );
+            contextAttachments = unused
+              .filter((entry) => attachmentPathByMessage.has(entry.messageId))
+              .map((entry) => ({
+                path: attachmentPathByMessage.get(entry.messageId)!,
+                label: `${senderNameByMessage.get(entry.messageId) ?? entry.senderId ?? '未知成员'}发送的${entry.kind === 'sticker' ? '表情包' : '图片'}`,
+              }));
+            const attachmentNumber = new Map(
+              unused.filter((entry) => attachmentPathByMessage.has(entry.messageId))
+                .map((entry, index) => [entry.messageId, index + 1]),
+            );
+            text = addWechatGroupContext(
+              text,
+              triggerPrefixes,
+              item.senderDisplayName ?? item.senderId ?? '提问者',
+              unused.map((entry) => ({
+                messageId: entry.messageId,
+                speaker: senderNameByMessage.get(entry.messageId) ?? entry.senderId ?? '未知成员',
+                text: attachmentNumber.has(entry.messageId)
+                  ? `${entry.text}（见附件 ${attachmentNumber.get(entry.messageId)}）`
+                  : entry.text,
+              })),
+              this.options.requirePrefix,
+            );
+          }
+        }
         this.logger.info({
           component: 'wechat', event: 'incoming_text', user_id: item.userId, display_name: item.displayName,
-          message_id: item.messageId,
+          message_id: item.messageId, context_message_count: contextMessageIds.length,
         }, '收到普通微信文本消息');
         await this.callback?.({
           platform: 'wechat',
@@ -143,7 +215,12 @@ export class WindowsPersonalWeChatAdapter implements PersonalWeChatAdapter {
           type: 'text',
           text,
           timestamp: item.timestamp || Date.now(),
+          triggerPrefixes,
+          attachments: contextAttachments,
         });
+        if (contextMessageIds.length > 0 && this.repository.wasWechatMessageSubmitted(item.userId, item.messageId)) {
+          this.repository.markWechatContextSubmitted(item.userId, contextMessageIds);
+        }
       }
     } catch (error) {
       await this.bridge.start().catch(() => undefined);

@@ -2,8 +2,11 @@ import { describe, expect, it } from 'vitest';
 import { OutgoingQueue } from '../src/wechat/outgoing-queue.js';
 import { WeChatReplySession } from '../src/wechat/reply-session.js';
 import {
+  addWechatGroupContext,
   extractWechatDatabaseSenderId,
+  matchWechatPrefix,
   normalizeWechatDatabaseText,
+  selectIncrementalWechatContext,
   splitWechatText,
 } from '../src/wechat/text.js';
 import type { PersonalWeChatAdapter } from '../src/wechat/types.js';
@@ -55,5 +58,37 @@ describe('personal WeChat helpers', () => {
     await Promise.all([work('a'), work('b'), work('c')]);
     expect(maxActive).toBe(1);
     expect(events).toEqual(['a:start', 'a:end', 'b:start', 'b:end', 'c:start', 'c:end']);
+  });
+
+  it('adds unused group history after the mention prefix with speaker labels', () => {
+    expect(matchWechatPrefix('@chatbot\u2005问题', ['@ChatBOT'])).toBeNull();
+    expect(matchWechatPrefix('@ChatBOT\u2005问题', ['@ChatBOT'])?.body).toBe('问题');
+    const prompt = addWechatGroupContext(
+      '@ChatBOT 问题',
+      ['@ChatBOT'],
+      '提问者',
+      [
+        { messageId: '1', speaker: '甲', text: '前文一' },
+        { messageId: '2', speaker: '乙', text: '前文二' },
+      ],
+      true,
+    );
+    expect(prompt).toContain('@ChatBOT\n\n【本次提问前的群聊上下文（按时间顺序）】');
+    expect(prompt).toContain('接着前一次的消息');
+    expect(prompt).toContain('1. 甲：前文一\n2. 乙：前文二');
+    expect(prompt).toContain('【本次提问】\n\n提问者：问题');
+  });
+
+  it('never backfills older messages after the previous submitted boundary', () => {
+    const newestFirst = Array.from({ length: 20 }, (_, index) => ({
+      messageId: String(index + 1),
+      text: `消息${index + 1}`,
+    }));
+    expect(selectIncrementalWechatContext(newestFirst, () => false).map((item) => item.messageId))
+      .toEqual(['10', '9', '8', '7', '6', '5', '4', '3', '2', '1']);
+    expect(selectIncrementalWechatContext(newestFirst, (id) => id === '4').map((item) => item.messageId))
+      .toEqual(['3', '2', '1']);
+    expect(selectIncrementalWechatContext(newestFirst, (id) => id === '1'))
+      .toEqual([]);
   });
 });

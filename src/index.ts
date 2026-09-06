@@ -50,6 +50,11 @@ async function main(): Promise<void> {
   const wecom = new WeComClient(config.wecomBotId, config.wecomBotSecret, logger);
   const queue = new GlobalTaskQueue();
   const conversations = new ConversationManager(repository);
+  const fallbackWechatPrefixes = [config.wechatPrefix, ...config.wechatPrefixAliases];
+  const acceptedWechatPrefixes = [...new Set([
+    ...fallbackWechatPrefixes,
+    ...config.wechatConversations.flatMap((item) => item.prefixes ?? []),
+  ])];
   const wechat = config.wechatEnabled
     ? new WindowsPersonalWeChatAdapter({
         projectRoot: process.cwd(),
@@ -58,7 +63,8 @@ async function main(): Promise<void> {
         sendIntervalMs: config.wechatSendIntervalMs,
         logDirectory: config.wechatLogDirectory,
         requirePrefix: config.wechatRequirePrefix,
-        prefixes: [config.wechatPrefix, ...config.wechatPrefixAliases],
+        prefixes: acceptedWechatPrefixes,
+        fallbackPrefixes: fallbackWechatPrefixes,
         canonicalNames: config.wechatCanonicalNames,
         readMode: config.wechatReadMode,
         dbPythonPath: config.wechatDbPythonPath,
@@ -72,7 +78,7 @@ async function main(): Promise<void> {
         allowlist: new Set(config.wechatAllowlist),
         requirePrefix: config.wechatRequirePrefix,
         prefix: config.wechatPrefix,
-        prefixes: [config.wechatPrefix, ...config.wechatPrefixAliases],
+        prefixes: fallbackWechatPrefixes,
       },
     },
     health: {

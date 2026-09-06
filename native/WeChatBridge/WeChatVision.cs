@@ -85,11 +85,21 @@ internal static class WeChatVision
         Func<AutomationElement, Bitmap> capture,
         Action<int, int> click)
     {
-        var rect = root.Current.BoundingRectangle;
+        root = PrepareWindow(root);
+        var rect = GetWindowBounds(root);
         if (rect.IsEmpty || rect.Width < 650 || rect.Height < 450)
-            throw new InvalidOperationException("微信窗口尺寸异常，无法使用视觉发送后备");
+            throw new InvalidOperationException(
+                $"微信窗口尺寸异常，无法使用视觉发送后备; handle={GetWindowHandle(root)}; size={(int)rect.Width}x{(int)rect.Height}");
 
         Select(root, displayName, capture, click);
+
+        // Selecting/searching a conversation can restore, move or resize the window.
+        // Never use coordinates captured before that interaction.
+        root = PrepareWindow(root);
+        rect = GetWindowBounds(root);
+        if (rect.IsEmpty || rect.Width < 650 || rect.Height < 450)
+            throw new InvalidOperationException(
+                $"选中会话后微信窗口尺寸异常; handle={GetWindowHandle(root)}; size={(int)rect.Width}x{(int)rect.Height}");
 
         // Composer is the lower-right portion of the official desktop client.
         click((int)(rect.Left + rect.Width * 0.62), (int)(rect.Top + rect.Height * 0.90));
@@ -104,10 +114,11 @@ internal static class WeChatVision
         Func<AutomationElement, Bitmap> capture,
         Action<int, int> click)
     {
-        var rect = root.Current.BoundingRectangle;
+        root = PrepareWindow(root);
         for (var attempt = 0; attempt < 3; attempt++)
         {
             BringToFront(root);
+            var rect = GetWindowBounds(root);
             using var bitmap = capture(root);
             var match = FindConversationLine(bitmap, displayName);
             if (match is not null)
@@ -631,13 +642,47 @@ internal static class WeChatVision
 
     private static void BringToFront(AutomationElement root)
     {
-        var handle = new IntPtr(root.Current.NativeWindowHandle);
+        var handle = GetWindowHandle(root);
         if (handle == IntPtr.Zero)
             throw new InvalidOperationException("无法激活微信窗口");
         try { root.SetFocus(); } catch { }
         ShowWindowAsync(handle, 9);
         BringWindowToTop(handle);
         if (!SetForegroundWindow(handle)) throw new InvalidOperationException("无法激活微信窗口");
+    }
+
+    private static AutomationElement PrepareWindow(AutomationElement root)
+    {
+        var handle = GetWindowHandle(root);
+        if (handle == IntPtr.Zero || !IsWindow(handle))
+            throw new InvalidOperationException("微信窗口句柄已失效");
+
+        ShowWindowAsync(handle, 9);
+        BringWindowToTop(handle);
+        SetForegroundWindow(handle);
+        Thread.Sleep(120);
+        try { return AutomationElement.FromHandle(handle); }
+        catch { return root; }
+    }
+
+    private static IntPtr GetWindowHandle(AutomationElement root)
+    {
+        try { return new IntPtr(root.Current.NativeWindowHandle); }
+        catch { return IntPtr.Zero; }
+    }
+
+    private static System.Windows.Rect GetWindowBounds(AutomationElement root)
+    {
+        var handle = GetWindowHandle(root);
+        if (handle != IntPtr.Zero && GetWindowRect(handle, out var nativeRect))
+        {
+            var width = nativeRect.Right - nativeRect.Left;
+            var height = nativeRect.Bottom - nativeRect.Top;
+            if (width > 0 && height > 0)
+                return new System.Windows.Rect(nativeRect.Left, nativeRect.Top, width, height);
+        }
+        try { return root.Current.BoundingRectangle; }
+        catch { return System.Windows.Rect.Empty; }
     }
 
     private static void Paste(string value)
@@ -709,4 +754,17 @@ internal static class WeChatVision
     private static extern bool BringWindowToTop(IntPtr window);
     [System.Runtime.InteropServices.DllImport("user32.dll")]
     private static extern bool ShowWindowAsync(IntPtr window, int command);
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern bool IsWindow(IntPtr window);
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern bool GetWindowRect(IntPtr window, out NativeRect rect);
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    private struct NativeRect
+    {
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
+    }
 }

@@ -14,6 +14,10 @@ CREATE TABLE IF NOT EXISTS contact_mappings (
   platform TEXT NOT NULL, user_id TEXT NOT NULL, display_name TEXT NOT NULL, updated_at INTEGER NOT NULL,
   PRIMARY KEY(platform, user_id)
 );
+CREATE TABLE IF NOT EXISTS wechat_context_messages (
+  conversation_id TEXT NOT NULL, message_id TEXT NOT NULL, sent_at INTEGER NOT NULL,
+  PRIMARY KEY(conversation_id, message_id)
+);
 CREATE TABLE IF NOT EXISTS conversations (userid TEXT PRIMARY KEY, chatgpt_url TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS tasks (
   id INTEGER PRIMARY KEY AUTOINCREMENT, msgid TEXT UNIQUE NOT NULL, userid TEXT NOT NULL,

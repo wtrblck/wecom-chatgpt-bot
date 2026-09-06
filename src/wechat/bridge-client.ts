@@ -21,9 +21,30 @@ export interface BridgeState {
   loggedIn: boolean;
   windowTitle?: string;
   detail?: string;
+  protocolVersion?: number;
+  sendMode?: 'uia' | 'legacy';
+  windowMinimized?: boolean;
+  sendAction?: 'enter' | 'ctrl-enter' | 'invoke';
+}
+
+/** Local client submission evidence, not server delivery or recipient receipt. */
+export interface BridgeSendReceipt {
+  submitted: true;
+  verified: boolean;
+  transport: 'uia' | 'legacy';
+  confirmation: 'composer-cleared' | 'unverified';
+  action?: 'enter' | 'ctrl-enter' | 'invoke' | 'legacy-enter';
+}
+
+export class WeChatBridgeError extends Error {
+  constructor(message: string, readonly code: string, readonly deliveryUnknown = false) {
+    super(message);
+    this.name = 'WeChatBridgeError';
+  }
 }
 
 interface PendingRequest {
+  operation: string;
   resolve: (value: any) => void;
   reject: (error: unknown) => void;
   timer: NodeJS.Timeout;
@@ -31,8 +52,10 @@ interface PendingRequest {
 
 export class WeChatBridgeClient {
   private process: ChildProcessWithoutNullStreams | null = null;
+  private starting: Promise<void> | null = null;
   private readonly pending = new Map<number, PendingRequest>();
   private nextId = 1;
+  private requestTail: Promise<unknown> = Promise.resolve();
 
   constructor(
     private readonly projectRoot: string,
@@ -41,38 +64,55 @@ export class WeChatBridgeClient {
   ) {}
 
   async start(): Promise<void> {
+    if (this.starting) return this.starting;
     if (this.process) return;
-    const candidates = ['publish-v24', 'publish-v23', 'publish-v22', 'publish-v21', 'publish-v20', 'publish-v19', 'publish-v18', 'publish-v17', 'publish-v16', 'publish-v15', 'publish-v14', 'publish-v13', 'publish-v12', 'publish-v11', 'publish-v10', 'publish-v9', 'publish-v8', 'publish-v7', 'publish-v6', 'publish-v5', 'publish-v4', 'publish-v3', 'publish-v2', 'publish']
-      .map((directory) => path.join(this.projectRoot, 'native', 'WeChatBridge', directory, 'WeChatBridge.exe'));
-    const published = candidates.find((candidate) => existsSync(candidate)) ?? candidates.at(-1)!;
-    const executable = this.executablePath || (existsSync(published) ? published : undefined);
-    const command = executable || 'dotnet';
-    const args = executable
-      ? []
-      : ['run', '--project', path.join(this.projectRoot, 'native', 'WeChatBridge', 'WeChatBridge.csproj'), '--no-launch-profile'];
-    this.process = spawn(command, args, { cwd: this.projectRoot, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
-    const lines = readline.createInterface({ input: this.process.stdout });
-    lines.on('line', (line) => this.handleLine(line));
-    this.process.stderr.on('data', (data) => {
+    const starting = this.startProcess();
+    this.starting = starting;
+    try { await starting; } finally { this.starting = null; }
+  }
+
+  private async startProcess(): Promise<void> {
+    const published = path.join(this.projectRoot, 'native', 'WeChatBridge', 'publish', 'WeChatBridge.exe');
+    const executable = this.executablePath || published;
+    if (!existsSync(executable)) throw new WeChatBridgeError(
+      '未找到微信桥接程序，请先运行 npm run wechat:build', 'WECHAT_BRIDGE_UNAVAILABLE');
+    // Launch the worker directly: killing a `dotnet run` parent does not stop its child.
+    const child = spawn(executable, [], {
+      cwd: this.projectRoot, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'],
+      env: {
+        ...process.env,
+        DOTNET_CLI_HOME: path.join(this.projectRoot, '.dotnet-home'),
+        NUGET_PACKAGES: path.join(this.projectRoot, '.nuget'),
+      },
+    });
+    this.process = child;
+    const lines = readline.createInterface({ input: child.stdout });
+    lines.on('line', (line) => { if (this.process === child) this.handleLine(line); });
+    child.stderr.on('data', (data) => {
       this.logger.debug({ component: 'wechat_bridge', event: 'stderr', detail: String(data).trim().slice(0, 500) }, '微信桥接进程输出');
     });
-    this.process.once('exit', (code) => {
-      const error = new Error(`微信桥接进程已退出，code=${code ?? 'unknown'}`);
-      for (const request of this.pending.values()) {
-        clearTimeout(request.timer);
-        request.reject(error);
-      }
-      this.pending.clear();
-      this.process = null;
+    child.on('error', (error) => this.invalidate(child, error.message));
+    child.stdin.on('error', (error) => this.invalidate(child, error.message));
+    child.once('exit', (code) => {
+      lines.close();
+      this.invalidate(child, `微信桥接进程已退出，code=${code ?? 'unknown'}`);
     });
-    await this.request<BridgeState>('health', {}, 30_000);
+    try {
+      const state = await this.request<BridgeState>('health', {}, 30_000);
+      if (state.protocolVersion !== 2) {
+        throw new WeChatBridgeError('微信桥接程序版本过旧，请运行 npm run wechat:build', 'WECHAT_BRIDGE_VERSION');
+      }
+    } catch (error) {
+      this.invalidate(child, '微信桥接进程启动失败');
+      throw error;
+    }
   }
 
   async stop(): Promise<void> {
-    if (!this.process) return;
+    const child = this.process;
+    if (!child) return;
     await this.request('stop', {}).catch(() => undefined);
-    this.process.kill();
-    this.process = null;
+    this.invalidate(child, '微信桥接进程已停止');
   }
 
   health(): Promise<BridgeState> {
@@ -87,8 +127,17 @@ export class WeChatBridgeClient {
     return this.request('poll', { requirePrefix, prefixes, canonicalNames }, 30_000);
   }
 
-  send(displayName: string, text: string): Promise<void> {
-    return this.request('send', { displayName, text });
+  async send(displayName: string, text: string, options: { resumeVerifiedDraft?: boolean } = {}): Promise<BridgeSendReceipt> {
+    const result = await this.request<BridgeSendReceipt>('send', {
+      displayName, text, ...(options.resumeVerifiedDraft ? { resumeVerifiedDraft: true } : {}),
+    });
+    if (result?.submitted !== true || typeof result.verified !== 'boolean'
+      || !['uia', 'legacy'].includes(result.transport)
+      || !['composer-cleared', 'unverified'].includes(result.confirmation)
+      || result.verified !== (result.transport === 'uia' && result.confirmation === 'composer-cleared')) {
+      throw new WeChatBridgeError('微信发送回执无效，提交状态未知，请先人工核对', 'WECHAT_DELIVERY_UNKNOWN', true);
+    }
+    return result;
   }
 
   select(displayName: string): Promise<void> {
@@ -108,20 +157,44 @@ export class WeChatBridgeClient {
   }
 
   private request<T>(operation: string, payload: Record<string, unknown>, timeoutMs = 15_000): Promise<T> {
-    if (!this.process) return Promise.reject(new Error('微信桥接进程未启动'));
-    const id = this.nextId++;
-    return new Promise<T>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(id);
-        reject(new Error(`微信桥接操作超时: ${operation}`));
-      }, timeoutMs);
-      this.pending.set(id, { resolve, reject, timer });
-      this.process?.stdin.write(`${JSON.stringify({ id, operation, ...payload })}\n`);
+    const child = this.process;
+    if (!child) return Promise.reject(new WeChatBridgeError('微信桥接进程未启动',
+      operation === 'send' ? 'WECHAT_SEND_REJECTED' : 'WECHAT_BRIDGE_UNAVAILABLE'));
+    // Start the deadline only once the native single-threaded worker can execute it.
+    const result = this.requestTail.then(() => {
+      if (this.process !== child) throw new WeChatBridgeError('微信桥接进程已失效，操作未提交',
+        operation === 'send' ? 'WECHAT_SEND_REJECTED' : 'WECHAT_BRIDGE_UNAVAILABLE');
+      const id = this.nextId++;
+      return new Promise<T>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          // Stop the old worker so a timed-out send cannot execute later from its queue.
+          this.invalidate(child, `微信桥接操作超时: ${operation}`);
+        }, timeoutMs);
+        this.pending.set(id, { operation, resolve, reject, timer });
+        child.stdin.write(`${JSON.stringify({ id, operation, ...payload })}\n`, (error) => {
+          if (error) this.invalidate(child, error.message);
+        });
+      });
     });
+    this.requestTail = result.catch(() => undefined);
+    return result;
+  }
+
+  private invalidate(child: ChildProcessWithoutNullStreams, message: string): void {
+    if (this.process !== child) return;
+    this.process = null;
+    child.kill();
+    for (const request of this.pending.values()) {
+      clearTimeout(request.timer);
+      const unknown = request.operation === 'send';
+      request.reject(new WeChatBridgeError(message,
+        unknown ? 'WECHAT_DELIVERY_UNKNOWN' : 'WECHAT_BRIDGE_UNAVAILABLE', unknown));
+    }
+    this.pending.clear();
   }
 
   private handleLine(line: string): void {
-    let response: { id?: number; ok?: boolean; result?: unknown; error?: string };
+    let response: { id?: number; ok?: boolean; result?: unknown; error?: string; code?: string; deliveryUnknown?: boolean };
     try {
       response = JSON.parse(line) as typeof response;
     } catch {
@@ -134,6 +207,7 @@ export class WeChatBridgeClient {
     clearTimeout(request.timer);
     this.pending.delete(response.id);
     if (response.ok) request.resolve(response.result);
-    else request.reject(new Error(response.error || '微信桥接操作失败'));
+    else request.reject(new WeChatBridgeError(response.error || '微信桥接操作失败',
+      response.code || 'WECHAT_BRIDGE_ERROR', response.deliveryUnknown === true));
   }
 }

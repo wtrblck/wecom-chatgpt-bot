@@ -1,5 +1,6 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import type { Logger } from 'pino';
 import type { WeChatConversationConfig } from '../config/wechat-conversations.js';
 import type { Repository } from '../conversation/repository.js';
@@ -30,8 +31,12 @@ export class WindowsPersonalWeChatAdapter implements PersonalWeChatAdapter {
   private readonly outgoing: OutgoingQueue;
   private callback: ((message: IncomingMessage) => Promise<void>) | null = null;
   private pollTimer: NodeJS.Timeout | null = null;
+  private polling: Promise<void> | null = null;
+  private receiving = true;
   private stopped = true;
   private lastState: BridgeState | null = null;
+  private lastSnapshotAt = 0;
+  private pollFailures = 0;
 
   constructor(
     private readonly options: PersonalWeChatAdapterOptions,
@@ -52,6 +57,7 @@ export class WindowsPersonalWeChatAdapter implements PersonalWeChatAdapter {
   async start(): Promise<void> {
     if (!this.stopped) return;
     this.stopped = false;
+    this.receiving = true;
     await fs.mkdir(this.options.logDirectory, { recursive: true });
     try {
       await this.bridge.start();
@@ -62,11 +68,14 @@ export class WindowsPersonalWeChatAdapter implements PersonalWeChatAdapter {
     } catch (error) {
       this.stopped = true;
       await this.recordFailure('start', undefined, error);
+      await this.dbReader?.stop().catch(() => undefined);
+      await this.bridge.stop().catch(() => undefined);
       throw error;
     }
   }
 
   async stop(): Promise<void> {
+    await this.stopReceiving();
     this.stopped = true;
     if (this.pollTimer) clearTimeout(this.pollTimer);
     this.pollTimer = null;
@@ -75,19 +84,43 @@ export class WindowsPersonalWeChatAdapter implements PersonalWeChatAdapter {
     await this.bridge.stop();
   }
 
-  async sendText(userId: string, text: string): Promise<void> {
+  async stopReceiving(): Promise<void> {
+    this.receiving = false;
+    if (this.pollTimer) clearTimeout(this.pollTimer);
+    this.pollTimer = null;
+    await this.polling;
+  }
+
+  async sendText(userId: string, text: string, deliveryKey: string = randomUUID()): Promise<void> {
     const displayName = this.repository.getContactDisplayName('wechat', userId);
     if (!displayName) throw new Error(`找不到微信联系人映射: ${userId}`);
-    for (const chunk of splitWechatText(text)) {
-      await this.outgoing.enqueue(async () => {
+    const existing = this.repository.deliveryParts(deliveryKey);
+    if (existing.some((part) => part.user_id !== userId)) throw new Error('已保存回复与目标会话不匹配');
+    // Retry preserves the original addressee/mention and exact persisted chunks.
+    if (!existing.length) this.repository.prepareDelivery(deliveryKey, userId, splitWechatText(text));
+    // A whole answer owns the worker, so other groups cannot interleave its parts.
+    await this.outgoing.enqueue(async () => {
+      for (const part of this.repository.deliveryParts(deliveryKey)) {
+        if (part.status === 'sent') continue;
+        if (this.stopped) throw new Error('微信发送已停止');
+        if (part.status === 'uncertain' || part.status === 'sending') {
+          throw new Error(`发送状态未知，请先核对微信再处理 outbox: ${deliveryKey}/${part.part}`);
+        }
+        this.repository.updateDelivery(deliveryKey, part.part, 'sending');
         try {
-          await this.bridge.send(displayName, chunk);
+          const receipt = await this.bridge.send(displayName, part.content);
+          if (!receipt.verified) throw new Error('客户端未提供可验证的提交回执');
+          this.repository.updateDelivery(deliveryKey, part.part, 'sent');
         } catch (error) {
+          const code = (error as { code?: string } | null)?.code;
+          this.repository.updateDelivery(deliveryKey, part.part, code === 'WECHAT_SEND_REJECTED' ? 'failed' : 'uncertain',
+            error instanceof Error ? error.message : String(error));
           await this.recordFailure('send_text', userId, error);
           throw error;
         }
-      });
-    }
+        await new Promise((resolve) => setTimeout(resolve, this.options.sendIntervalMs));
+      }
+    });
   }
 
   async healthCheck(): Promise<boolean> {
@@ -101,39 +134,47 @@ export class WindowsPersonalWeChatAdapter implements PersonalWeChatAdapter {
   }
 
   private schedulePoll(delayMs: number): void {
-    if (this.stopped) return;
-    this.pollTimer = setTimeout(() => void this.poll(), delayMs);
+    if (this.stopped || !this.receiving) return;
+    this.pollTimer = setTimeout(() => {
+      this.polling = this.poll().finally(() => { this.polling = null; });
+    }, delayMs);
   }
 
   private async poll(): Promise<void> {
     try {
+      await this.dispatchInbox();
       if (this.dbReader) {
-        if (!(await this.dbReader.health()).ready) return;
+        await this.dbReader.start();
       } else {
         this.lastState = await this.bridge.health();
         if (!this.lastState.windowFound || !this.lastState.loggedIn) return;
       }
-      const messages = this.dbReader
+      const batch = this.dbReader
         ? await this.dbReader.poll()
-        : await this.bridge.poll(
+        : { batchId: null, messages: await this.bridge.poll(
             this.options.requirePrefix,
             this.options.prefixes,
             this.options.canonicalNames,
-          );
-      for (const item of messages) {
+          ) };
+      const incoming: IncomingMessage[] = [];
+      for (const item of batch.messages) {
         const text = this.dbReader
           ? normalizeWechatDatabaseText(item.userId, item.text)
           : item.text;
         const senderId = this.dbReader
-          ? extractWechatDatabaseSenderId(item.userId, item.text) ?? item.senderId
+          ? item.senderId ?? extractWechatDatabaseSenderId(item.userId, item.text)
           : item.senderId;
         if (item.isSelf || !item.messageId || !item.userId || !text) continue;
+        const selected = this.options.dbConversations.some((chat) => chat.enabled && (
+          chat.id ? chat.id === item.userId : chat.name === item.displayName
+        ));
+        if (!selected) continue;
         if (this.repository.hasIncoming('wechat', item.messageId)) continue;
         this.logger.info({
           component: 'wechat', event: 'incoming_text', user_id: item.userId, display_name: item.displayName,
           message_id: item.messageId,
         }, '收到普通微信文本消息');
-        await this.callback?.({
+        incoming.push({
           platform: 'wechat',
           messageId: item.messageId,
           userId: item.userId,
@@ -145,12 +186,27 @@ export class WindowsPersonalWeChatAdapter implements PersonalWeChatAdapter {
           timestamp: item.timestamp || Date.now(),
         });
       }
+      // Commit the complete batch before advancing the Python reader's cursor.
+      this.repository.saveInbox(incoming);
+      if (batch.batchId) await this.dbReader!.ack(batch.batchId);
+      await this.dispatchInbox();
+      this.pollFailures = 0;
     } catch (error) {
+      this.pollFailures++;
       await this.bridge.start().catch(() => undefined);
       await this.dbReader?.start().catch(() => undefined);
       await this.recordFailure('poll', undefined, error);
     } finally {
-      this.schedulePoll(this.options.pollIntervalMs);
+      this.schedulePoll(Math.min(30_000, this.options.pollIntervalMs * 2 ** Math.min(this.pollFailures, 5)));
+    }
+  }
+
+  private async dispatchInbox(): Promise<void> {
+    if (!this.callback || this.stopped || !this.receiving) return;
+    for (const message of this.repository.pendingInbox()) {
+      if (this.stopped) break;
+      await this.callback(message);
+      this.repository.finishInbox(message.messageId);
     }
   }
 
@@ -166,8 +222,11 @@ export class WindowsPersonalWeChatAdapter implements PersonalWeChatAdapter {
     this.logger.error({ component: 'wechat', event: 'operation_failed', ...entry }, '普通微信 Adapter 操作失败');
     const logFile = path.join(this.options.logDirectory, 'adapter-errors.jsonl');
     await fs.appendFile(logFile, `${JSON.stringify(entry)}\n`, 'utf8').catch(() => undefined);
-    const imageFile = path.join(this.options.logDirectory, `${timestamp.replace(/[:.]/g, '-')}-${operation}.png`);
-    await this.bridge.snapshot(imageFile).catch(() => undefined);
+    if (Date.now() - this.lastSnapshotAt >= 60_000) {
+      this.lastSnapshotAt = Date.now();
+      const imageFile = path.join(this.options.logDirectory, `${timestamp.replace(/[:.]/g, '-')}-${operation}.png`);
+      await this.bridge.snapshot(imageFile).catch(() => undefined);
+    }
   }
 
   private safeState(state: BridgeState | null): Record<string, unknown> {

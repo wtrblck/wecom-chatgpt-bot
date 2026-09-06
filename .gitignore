@@ -1,4 +1,8 @@
 node_modules/
+.cache/
+**/__pycache__/
+.venv/
+.nuget/
 dist/
 .env
 config/wechat-conversations.json
@@ -7,6 +11,8 @@ latest.log
 data/browser-profile/
 data/*.sqlite
 data/*.sqlite-*
+data/*.sqlite.lock
+data/*.sqlite.control.json
 data/wechat-db-cache/
 .venv-wechatdb/
 logs/*.log
@@ -18,6 +24,9 @@ native/WeChatBridge/bin/
 native/WeChatBridge/obj/
 native/WeChatBridge/publish/
 native/WeChatBridge/publish-v*/
+native/WeChatAccessibility/bin/
+native/WeChatAccessibility/obj/
+native/WeChatAccessibility/publish/
 vendor/wechatauto-replica/*
 !vendor/wechatauto-replica/LICENSE
 !vendor/wechatauto-replica/UPSTREAM.md
@@ -26,4 +35,10 @@ vendor/wechatauto-replica/wechatauto/*
 !vendor/wechatauto-replica/wechatauto/db.py
 .dotnet-home/
 coverage/
+release/
+native/WeChatDesktop/bin/
+native/WeChatDesktop/obj/
+data/desktop-settings.json
+data/desktop-settings.json.*.tmp
+data/desktop-session.lock
 playwright-report/

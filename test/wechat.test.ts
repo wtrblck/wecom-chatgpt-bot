@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { OutgoingQueue } from '../src/wechat/outgoing-queue.js';
 import { WeChatReplySession } from '../src/wechat/reply-session.js';
 import {
@@ -11,13 +11,13 @@ import type { PersonalWeChatAdapter } from '../src/wechat/types.js';
 describe('personal WeChat helpers', () => {
   it('removes the WeChat database sender envelope from group text', () => {
     expect(normalizeWechatDatabaseText(
-      '20663368641@chatroom',
-      'wxid_u3yyhe3yrwh122:\n@ChatBOT\u2005111',
+      'example@chatroom',
+      'wxid_example:\n@ChatBOT\u2005111',
     )).toBe('@ChatBOT\u2005111');
     expect(extractWechatDatabaseSenderId(
-      '20663368641@chatroom',
-      'wxid_u3yyhe3yrwh122:\n@ChatBOT\u2005111',
-    )).toBe('wxid_u3yyhe3yrwh122');
+      'example@chatroom',
+      'wxid_example:\n@ChatBOT\u2005111',
+    )).toBe('wxid_example');
     expect(normalizeWechatDatabaseText('wxid_friend', '/gpt hello')).toBe('/gpt hello');
   });
 
@@ -55,5 +55,34 @@ describe('personal WeChat helpers', () => {
     await Promise.all([work('a'), work('b'), work('c')]);
     expect(maxActive).toBe(1);
     expect(events).toEqual(['a:start', 'a:end', 'b:start', 'b:end', 'c:start', 'c:end']);
+  });
+
+  it('preserves pacing when callers await each send and the queue temporarily empties', async () => {
+    vi.useFakeTimers();
+    try {
+      const queue = new OutgoingQueue(1_000);
+      const sentAt: number[] = [];
+      await queue.enqueue(async () => { sentAt.push(Date.now()); });
+      const next = queue.enqueue(async () => { sentAt.push(Date.now()); });
+      await vi.advanceTimersByTimeAsync(999);
+      expect(sentAt).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(1);
+      await next;
+      expect(sentAt[1]! - sentAt[0]!).toBeGreaterThanOrEqual(1_000);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('does not start a waiting send after close during the pacing delay', async () => {
+    vi.useFakeTimers();
+    try {
+      const queue = new OutgoingQueue(1_000);
+      await queue.enqueue(async () => undefined);
+      const run = vi.fn(async () => undefined);
+      const waiting = expect(queue.enqueue(run)).rejects.toThrow('已停止');
+      queue.close();
+      await vi.advanceTimersByTimeAsync(1_000);
+      await waiting;
+      expect(run).not.toHaveBeenCalled();
+    } finally { vi.useRealTimers(); }
   });
 });

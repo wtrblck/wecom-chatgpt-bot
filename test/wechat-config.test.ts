@@ -3,7 +3,7 @@ import {
   parseWechatConversations,
   resolveWechatSystemPrompt,
 } from '../src/config/wechat-conversations.js';
-import { applySystemPrompt } from '../src/core/message-router.js';
+import { buildConversationInstructions } from '../src/core/reply-style.js';
 
 describe('WeChat conversation configuration', () => {
   it('parses enabled listeners and their system prompts', () => {
@@ -30,8 +30,8 @@ describe('WeChat conversation configuration', () => {
   });
 
   it('wraps only the browser prompt and does not nest an empty prompt', () => {
-    expect(applySystemPrompt('用户问题', '回答要简洁')).toContain('回答要简洁');
-    expect(applySystemPrompt('用户问题', '回答要简洁')).toContain('用户问题');
-    expect(applySystemPrompt('用户问题', '')).toBe('用户问题');
+    expect(buildConversationInstructions('回答要简洁')).toContain('回答要简洁');
+    expect(buildConversationInstructions('回答要简洁')).toContain('下一条消息');
+    expect(buildConversationInstructions('')).toBeNull();
   });
 });

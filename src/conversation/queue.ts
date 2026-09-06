@@ -13,8 +13,11 @@ export class GlobalTaskQueue {
   private readonly pending: PendingJob[] = [];
   private current: PendingJob | null = null;
   private draining = false;
+  private closed = false;
+  private idleWaiters: (() => void)[] = [];
 
   enqueue(job: QueueJob): number {
+    if (this.closed) throw new Error('任务队列已停止');
     const ahead = this.pending.length + (this.current ? 1 : 0);
     this.pending.push({ ...job, controller: new AbortController() });
     void this.drain();
@@ -27,6 +30,14 @@ export class GlobalTaskQueue {
 
   get activeUser(): string | null {
     return this.current?.userid ?? null;
+  }
+
+  async close(): Promise<void> {
+    this.closed = true;
+    // Queued jobs stay durable for the next start. Never start another browser job.
+    this.pending.splice(0);
+    this.current?.controller.abort();
+    if (this.draining) await new Promise<void>((resolve) => this.idleWaiters.push(resolve));
   }
 
   async stopUser(userid: string): Promise<{ running: boolean; queued: number }> {
@@ -48,7 +59,7 @@ export class GlobalTaskQueue {
     if (this.draining) return;
     this.draining = true;
     try {
-      while (this.pending.length > 0) {
+      while (!this.closed && this.pending.length > 0) {
         const job = this.pending.shift();
         if (!job) continue;
         this.current = job;
@@ -62,6 +73,7 @@ export class GlobalTaskQueue {
       }
     } finally {
       this.draining = false;
+      this.idleWaiters.splice(0).forEach((resolve) => resolve());
       if (this.pending.length > 0) void this.drain();
     }
   }

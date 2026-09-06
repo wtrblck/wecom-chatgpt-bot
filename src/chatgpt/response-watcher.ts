@@ -17,10 +17,10 @@ export function responseIsComplete(options: {
   stableForMs: number;
 }): boolean {
   if (!options.text || options.stableForMs < 1_300) return false;
-  if (!options.stopVisible || options.sendVisible) return true;
-  // Some ChatGPT builds leave a stale stop control in the DOM after the
-  // answer has finished. Do not wait for the full generation timeout.
-  return options.stableForMs >= 8_000;
+  // Thinking, web searches, and tool use can pause the visible answer for a
+  // long time. A visible Stop control takes precedence over both text stability
+  // and a Send control; if it never disappears, report a timeout, not success.
+  return !options.stopVisible;
 }
 
 export function hasAssistantResponseStarted(options: {

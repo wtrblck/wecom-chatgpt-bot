@@ -15,8 +15,8 @@ export class WeChatReplySession implements ReplySession {
 
   async update(_content: string): Promise<void> {}
 
-  async finish(content: string): Promise<void> {
-    await this.adapter.sendText(this.userId, this.withMention(content));
+  async finish(content: string, deliveryKey?: string): Promise<void> {
+    await this.adapter.sendText(this.userId, this.withMention(content), deliveryKey);
   }
 
   private withMention(content: string): string {

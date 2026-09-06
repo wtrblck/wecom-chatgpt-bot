@@ -2,7 +2,7 @@ export type Command = '/new' | '/status' | '/stop' | '/retry' | '/help';
 
 export const HELP_TEXT = `可用命令：
 /new - 开始新的 ChatGPT 对话
-/retry - 重试上一条问题
+/retry - 优先补发已保存答案，否则重试上一条问题
 /stop - 停止当前生成并取消你的排队任务
 /status - 查看运行状态
 /help - 显示本帮助`;

@@ -22,6 +22,15 @@ CREATE TABLE IF NOT EXISTS tasks (
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_user_created ON tasks(userid, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+CREATE TABLE IF NOT EXISTS wechat_inbox (
+  message_id TEXT PRIMARY KEY, payload TEXT NOT NULL, received_at INTEGER NOT NULL,
+  handled_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS wechat_outbox (
+  delivery_key TEXT NOT NULL, part INTEGER NOT NULL, user_id TEXT NOT NULL, content TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('pending','sending','sent','failed','uncertain')),
+  error TEXT, updated_at INTEGER NOT NULL, PRIMARY KEY(delivery_key, part)
+);
 `;
 
 export function openDatabase(databasePath: string): Database.Database {

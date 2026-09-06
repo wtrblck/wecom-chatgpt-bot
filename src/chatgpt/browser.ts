@@ -3,7 +3,6 @@ import path from 'node:path';
 import { chromium, type BrowserContext, type Page } from 'playwright';
 import type { Logger } from 'pino';
 import { BrowserState } from '../types/index.js';
-import { retry } from '../utils/retry.js';
 import {
   BrowserLaunchError,
   ChatGPTDOMChangedError,
@@ -11,6 +10,7 @@ import {
   ChatGPTLoginRequiredError,
   ChatGPTNavigationError,
   ChatGPTSendError,
+  ChatGPTSendUncertainError,
 } from './errors.js';
 import {
   findAssistantMessages,
@@ -37,8 +37,10 @@ export class ChatGPTBrowser {
   private context: BrowserContext | null = null;
   private page: Page | null = null;
   private currentConversationUrl: string | null = null;
-  private recoveryAttempts = 0;
   private closing = false;
+  private starting: Promise<void> | null = null;
+  private recovering: Promise<void> | null = null;
+  private closingPromise: Promise<void> | null = null;
   private lastLoginDiagnosticAt = 0;
   state = BrowserState.STARTING;
 
@@ -48,34 +50,63 @@ export class ChatGPTBrowser {
   ) {}
 
   async start(): Promise<void> {
+    if (this.closing) throw new BrowserLaunchError('浏览器正在关闭，不能重新启动');
+    if (this.starting) return this.starting;
+    if (this.context && this.page) return;
+    const starting = Promise.resolve().then(() => this.launch());
+    this.starting = starting;
+    try { await starting; } finally {
+      if (this.starting === starting) this.starting = null;
+    }
+  }
+
+  private async launch(): Promise<void> {
+    if (this.closing) throw new BrowserLaunchError('浏览器正在关闭，不能重新启动');
     this.state = BrowserState.STARTING;
-    await fs.mkdir(this.options.profilePath, { recursive: true });
-    await fs.mkdir(this.options.debugDirectory, { recursive: true });
+    let context: BrowserContext | null = null;
     try {
-      this.context = await chromium.launchPersistentContext(this.options.profilePath, {
+      await fs.mkdir(this.options.profilePath, { recursive: true });
+      await fs.mkdir(this.options.debugDirectory, { recursive: true });
+      if (this.closing) throw new BrowserLaunchError('浏览器正在关闭，不能重新启动');
+      context = await chromium.launchPersistentContext(this.options.profilePath, {
         headless: this.options.headless,
         viewport: { width: 1365, height: 900 },
         args: ['--disable-blink-features=AutomationControlled'],
       });
-      this.page = this.context.pages()[0] ?? (await this.context.newPage());
+      if (this.closing) throw new BrowserLaunchError('浏览器启动期间收到关闭请求');
+      this.context = context;
+      this.page = context.pages()[0] ?? (await context.newPage());
       await this.navigate(this.currentConversationUrl ?? this.options.chatgptUrl);
       await this.refreshLoginState();
       this.bindCrashRecovery();
-      this.recoveryAttempts = 0;
     } catch (error) {
       this.state = BrowserState.ERROR;
-      await this.context?.close().catch(() => undefined);
-      this.context = null;
-      this.page = null;
+      await context?.close().catch((closeError) => {
+        this.logger.error({ component: 'browser', event: 'launch_cleanup_failed', error: closeError }, '浏览器启动失败后的清理失败');
+      });
+      if (this.context === context) {
+        this.context = null;
+        this.page = null;
+      }
       throw new BrowserLaunchError(error instanceof Error ? error.message : String(error));
     }
   }
 
   async close(): Promise<void> {
     this.closing = true;
-    await this.context?.close().catch(() => undefined);
-    this.context = null;
-    this.page = null;
+    if (this.closingPromise) return this.closingPromise;
+    this.closingPromise = (async () => {
+      // A recovery may still be launching Chromium. Wait for it to either hand
+      // us its context or close that context after observing `closing`.
+      await this.starting?.catch(() => undefined);
+      await this.recovering?.catch(() => undefined);
+      const context = this.context;
+      try { await context?.close(); } finally {
+        this.context = null;
+        this.page = null;
+      }
+    })();
+    return this.closingPromise;
   }
 
   async waitForLogin(): Promise<void> {
@@ -124,12 +155,25 @@ export class ChatGPTBrowser {
   }
 
   async loadConversation(url: string | null): Promise<void> {
+    if (this.recovering) await this.recovering;
+    if (this.closing) throw new BrowserLaunchError('浏览器正在关闭');
     if (!this.page) await this.start();
     const target = url ?? this.options.chatgptUrl;
     this.currentConversationUrl = url;
     const page = this.requirePage();
-    if (page.url() !== target) await this.navigate(target);
+    // The root URL can stay unchanged for temporary chats or while a new chat
+    // is being saved. Always reload it for a fresh conversation, even when the
+    // address matches, so a second group cannot inherit the previous chat.
+    if (url === null || page.url() !== target) await this.navigate(target);
     await this.assertReady();
+    const expectedUrl = new URL(target);
+    const actualUrl = new URL(page.url());
+    if (actualUrl.origin !== expectedUrl.origin || actualUrl.pathname !== expectedUrl.pathname) {
+      throw new ChatGPTNavigationError('ChatGPT 未打开指定会话，已停止本次发送，避免会话混用');
+    }
+    if (url === null && (await findUserMessages(page).count() > 0 || await findAssistantMessages(page).count() > 0)) {
+      throw new ChatGPTNavigationError('ChatGPT 新会话仍含历史消息，请将 CHATGPT_URL 配置为新会话页面');
+    }
   }
 
   async generate(
@@ -165,6 +209,9 @@ export class ChatGPTBrowser {
       const conversationUrl = page.url();
       this.currentConversationUrl = conversationUrl;
       return { text, conversationUrl };
+    } catch (error) {
+      await this.stopGeneration().catch(() => undefined);
+      throw error;
     } finally {
       if (this.state === BrowserState.GENERATING) this.state = BrowserState.READY;
     }
@@ -178,13 +225,19 @@ export class ChatGPTBrowser {
     await this.assertReady();
     const page = this.requirePage();
     const regenerate = findRegenerateButton(page);
-    if (!(await regenerate.isVisible().catch(() => false))) return this.generate(fallbackPrompt, onUpdate, signal);
+    const previousPrompt = await findUserMessages(page).last().innerText().catch(() => '');
+    // A failed task may never have reached the webpage. In that case the
+    // regenerate control still belongs to an older question.
+    if (previousPrompt.trim() !== fallbackPrompt.trim() || !(await regenerate.isVisible().catch(() => false))) {
+      return this.generate(fallbackPrompt, onUpdate, signal);
+    }
     this.state = BrowserState.GENERATING;
     try {
       const assistantCount = await findAssistantMessages(page).count();
       const initialText = assistantCount > 0
         ? (await findAssistantMessages(page).last().innerText().catch(() => '')).trim()
         : '';
+      if (signal?.aborted) throw new ChatGPTGenerationStoppedError('generation stopped');
       await regenerate.click();
       const text = await watchResponse({
         page,
@@ -194,40 +247,56 @@ export class ChatGPTBrowser {
         signal,
         onUpdate,
       });
+      this.currentConversationUrl = page.url();
       return { text, conversationUrl: page.url() };
+    } catch (error) {
+      await this.stopGeneration().catch(() => undefined);
+      throw error;
     } finally {
       if (this.state === BrowserState.GENERATING) this.state = BrowserState.READY;
     }
   }
 
   async stopGeneration(): Promise<boolean> {
-    if (this.state !== BrowserState.GENERATING || !this.page) return false;
+    // State may already have changed after a generation error or cancellation.
+    // The actual page control is the authority on whether generation can stop.
+    if (!this.page) return false;
     const stop = findStopButton(this.page);
     if (!(await stop.isVisible().catch(() => false))) return false;
-    await stop.click().catch(() => undefined);
-    return true;
+    return stop.click().then(() => true, () => false);
   }
 
   private async sendMessage(text: string, signal?: AbortSignal): Promise<void> {
     const page = this.requirePage();
     if (signal?.aborted) throw new ChatGPTGenerationStoppedError('generation stopped');
     const oldUserCount = await findUserMessages(page).count();
-    await retry(async () => {
+    let submissionAttempted = false;
+    try {
       if (await findStopButton(page).isVisible().catch(() => false)) throw new ChatGPTSendError('上一次生成尚未结束');
       const editor = findPromptEditor(page);
       await editor.waitFor({ state: 'visible', timeout: 15_000 });
       await editor.fill(text);
+      if (signal?.aborted) throw new ChatGPTGenerationStoppedError('generation stopped');
       const send = findSendButton(page);
-      if (await send.isVisible().catch(() => false)) await send.click();
-      else await editor.press('Enter');
+      if (await send.isVisible().catch(() => false)) {
+        submissionAttempted = true;
+        await send.click();
+      } else {
+        submissionAttempted = true;
+        await editor.press('Enter');
+      }
       await page.waitForFunction(
         (count) => document.querySelectorAll('[data-message-author-role="user"]').length > count,
         oldUserCount,
         { timeout: 10_000 },
       );
-    }, 2, 700).catch((error) => {
+    } catch (error) {
+      if (error instanceof ChatGPTGenerationStoppedError) throw error;
+      if (submissionAttempted) {
+        throw new ChatGPTSendUncertainError('ChatGPT 提交状态无法确认，问题可能已发送；未自动重发，请检查网页后再决定是否 /retry');
+      }
       throw new ChatGPTSendError(error instanceof Error ? error.message : String(error));
-    });
+    }
   }
 
   private async refreshLoginState(): Promise<void> {
@@ -261,19 +330,45 @@ export class ChatGPTBrowser {
   }
 
   private async recover(reason: string): Promise<void> {
-    if (this.state === BrowserState.RECOVERING || this.closing) return;
+    if (this.closing) return;
+    if (this.recovering) return this.recovering;
+    const recovering = Promise.resolve().then(() => this.recoverBrowser(reason));
+    this.recovering = recovering;
+    try { await recovering; } finally {
+      if (this.recovering === recovering) this.recovering = null;
+    }
+  }
+
+  async showWindow(): Promise<void> {
+    await this.start();
+    await this.requirePage().bringToFront();
+  }
+
+  /** Account evidence only: an anonymous ChatGPT page can also have an editor. */
+  async accountStatus(): Promise<'authenticated' | 'signed-out' | 'unknown'> {
+    if (!this.page || this.page.isClosed()) return 'unknown';
+    if (await findAuthenticatedUi(this.page).isVisible().catch(() => false)) return 'authenticated';
+    if (/auth|login|signup/i.test(this.page.url()) || await findLoginControls(this.page).isVisible().catch(() => false)) return 'signed-out';
+    return 'unknown';
+  }
+
+  private async recoverBrowser(reason: string): Promise<void> {
+    if (this.closing) return;
     this.state = BrowserState.RECOVERING;
     this.logger.warn({ component: 'browser', event: reason }, '正在恢复浏览器');
-    while (this.recoveryAttempts < 3 && !this.closing) {
-      this.recoveryAttempts += 1;
-      await this.context?.close().catch(() => undefined);
+    for (let attempt = 1; attempt <= 3 && !this.closing; attempt++) {
+      const context = this.context;
       this.context = null;
       this.page = null;
+      await context?.close().catch((error) => {
+        this.logger.warn({ component: 'browser', event: 'recovery_close_failed', error }, '恢复前关闭浏览器失败');
+      });
+      if (this.closing) return;
       try {
         await this.start();
         return;
       } catch (error) {
-        this.logger.error({ component: 'browser', event: 'recovery_failed', attempt: this.recoveryAttempts, error }, '浏览器恢复失败');
+        this.logger.error({ component: 'browser', event: 'recovery_failed', attempt, error }, '浏览器恢复失败');
       }
     }
     this.state = BrowserState.ERROR;

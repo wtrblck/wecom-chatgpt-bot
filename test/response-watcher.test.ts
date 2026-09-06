@@ -23,9 +23,9 @@ describe('ChatGPT response completion', () => {
     })).toBe(false);
   });
 
-  it('finishes when stable text and the send control has returned', () => {
+  it('finishes after stable text when the stop control has disappeared', () => {
     expect(responseIsComplete({
-      text: '完整回答', stopVisible: true, sendVisible: true, stableForMs: 1_500,
+      text: '完整回答', stopVisible: false, sendVisible: true, stableForMs: 1_500,
     })).toBe(true);
   });
 
@@ -35,9 +35,15 @@ describe('ChatGPT response completion', () => {
     })).toBe(false);
   });
 
-  it('recovers from a stale stop control after text remains stable', () => {
+  it('does not truncate a long thinking or tool-use pause', () => {
     expect(responseIsComplete({
-      text: '完整回答', stopVisible: true, sendVisible: false, stableForMs: 8_000,
-    })).toBe(true);
+      text: '部分回答', stopVisible: true, sendVisible: false, stableForMs: 60_000,
+    })).toBe(false);
+  });
+
+  it('never lets a visible Send control override active generation', () => {
+    expect(responseIsComplete({
+      text: '部分回答', stopVisible: true, sendVisible: true, stableForMs: 60_000,
+    })).toBe(false);
   });
 });

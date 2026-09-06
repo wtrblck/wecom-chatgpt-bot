@@ -16,6 +16,7 @@ export interface BridgeIncomingMessage {
   sortSeq?: number;
   kind?: 'text' | 'image' | 'sticker' | 'link';
   localId?: number;
+  shard?: string;
   attachmentPath?: string;
 }
 

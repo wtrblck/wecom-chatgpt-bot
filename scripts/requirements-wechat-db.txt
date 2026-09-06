@@ -2,3 +2,4 @@ cryptography==46.0.5
 zstandard==0.25.0
 cffi==2.1.1
 pycparser==3.0
+Pillow==11.3.0

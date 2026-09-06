@@ -1,7 +1,14 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { parseDesktopSettings, readDesktopSettings, saveDesktopSettings } from '../src/config/desktop-settings.js';
+import {
+  DEFAULT_INITIAL_INSTRUCTION,
+  DEFAULT_INSTRUCTION_TEMPLATE,
+  DEFAULT_PERSONA,
+  parseDesktopSettings,
+  readDesktopSettings,
+  saveDesktopSettings,
+} from '../src/config/desktop-settings.js';
 import { loadConfig } from '../src/config/config.js';
 import { resolveWechatSystemPrompt } from '../src/config/wechat-conversations.js';
 import { DesktopService } from '../src/desktop/service.js';
@@ -122,6 +129,49 @@ describe('desktop configuration and integration', () => {
       await service.action('stop');
       expect((await service.state()).phase).toBe('stopped');
       expect((await service.state()).account).toBe('unknown');
+    } finally { await service.action('close'); }
+  });
+});
+
+describe('style and media configuration migration', () => {
+  it('keeps legacy instructions enabled while media is opt-in and validates new fields', () => {
+    expect(parseDesktopSettings(valid())).toMatchObject({ styleEnabled: true, persona: '', languageStyle: '', mediaEnabled: false,
+      initialInstruction: '', selectedInstructionTemplateId: '', instructionTemplates: [DEFAULT_INSTRUCTION_TEMPLATE] });
+    for (const field of ['styleEnabled', 'mediaEnabled']) expect(() => parseDesktopSettings({ ...valid(), [field]: 'false' })).toThrow();
+    expect(() => parseDesktopSettings({ ...valid(), role: 'x'.repeat(2001) })).toThrow();
+    const directory = root();
+    saveDesktopSettings(directory, { ...valid(), styleEnabled: false, role: '猫娘', languageStyle: '甜蜜', mediaEnabled: true });
+    vi.stubEnv('WECOM_ENABLED', 'false'); vi.stubEnv('WECHAT_ENABLED', 'true');
+    expect(loadConfig(directory)).toMatchObject({ styleEnabled: false, persona: '猫娘', languageStyle: '甜蜜', wechatMediaEnabled: true });
+  });
+  it('previews unsaved style without changing stored settings', async () => {
+    const directory = root(); saveDesktopSettings(directory, valid());
+    const service = new DesktopService(directory);
+    try {
+      const preview = await service.action('composeInstruction', { ...valid(), persona: '猫娘', languageStyle: '甜蜜' }) as { instructions: string };
+      expect(preview.instructions).toContain('【人物设定】\n猫娘');
+      expect(readDesktopSettings(directory)?.persona).toBe('');
+      expect(await service.action('previewStyle', { ...valid(), initialInstruction: '可编辑的完整指令' })).toEqual({ instructions: '可编辑的完整指令' });
+      expect(await service.action('previewStyle', { ...valid(), styleEnabled: false })).toEqual({ instructions: null });
+    } finally { await service.action('close'); }
+  });
+  it('provides the requested default and persists reusable named instruction templates', async () => {
+    const directory = root(); const service = new DesktopService(directory);
+    try {
+      expect(service.settings()).toMatchObject({ persona: DEFAULT_PERSONA, initialInstruction: DEFAULT_INITIAL_INSTRUCTION,
+        selectedInstructionTemplateId: DEFAULT_INSTRUCTION_TEMPLATE.id, instructionTemplates: [DEFAULT_INSTRUCTION_TEMPLATE] });
+      expect(DEFAULT_INITIAL_INSTRUCTION).toContain('你是一个群聊机器人');
+      expect(DEFAULT_INITIAL_INSTRUCTION).toContain('【人物设定】\n姓名：劳大');
+      expect(DEFAULT_INITIAL_INSTRUCTION).toContain('要说”what can i say“');
+      const custom = { id: 'custom-one', name: '项目群', content: '你是项目群助手。' };
+      const saved = saveDesktopSettings(directory, { ...valid(), persona: '劳大', initialInstruction: custom.content,
+        selectedInstructionTemplateId: custom.id, instructionTemplates: [custom] });
+      expect(saved.instructionTemplates).toEqual([DEFAULT_INSTRUCTION_TEMPLATE, custom]);
+      expect(readDesktopSettings(directory)).toMatchObject({ initialInstruction: custom.content,
+        selectedInstructionTemplateId: custom.id, instructionTemplates: [DEFAULT_INSTRUCTION_TEMPLATE, custom] });
+      expect(() => parseDesktopSettings({ ...valid(), instructionTemplates: [{ ...custom, name: DEFAULT_INSTRUCTION_TEMPLATE.name }] })).toThrow('不能重复');
+      expect(() => parseDesktopSettings({ ...valid(), initialInstruction: 'x'.repeat(16001) })).toThrow();
+      expect(() => parseDesktopSettings({ ...valid(), selectedInstructionTemplateId: 'missing' })).toThrow('不存在');
     } finally { await service.action('close'); }
   });
 });

@@ -33,6 +33,7 @@ export interface PersonalWeChatAdapterOptions {
   readMode: 'ocr' | 'db';
   dbPythonPath: string;
   dbConversations: readonly WeChatConversationConfig[];
+  mediaEnabled?: boolean;
 }
 
 export class WindowsPersonalWeChatAdapter implements PersonalWeChatAdapter {
@@ -55,7 +56,7 @@ export class WindowsPersonalWeChatAdapter implements PersonalWeChatAdapter {
   ) {
     this.bridge = new WeChatBridgeClient(options.projectRoot, options.bridgePath, logger);
     this.dbReader = options.readMode === 'db'
-      ? new WeChatDbReaderClient(options.projectRoot, options.dbPythonPath, options.dbConversations, logger)
+      ? new WeChatDbReaderClient(options.projectRoot, options.dbPythonPath, options.dbConversations, logger, options.mediaEnabled === true)
       : null;
     this.outgoing = new OutgoingQueue(options.sendIntervalMs);
   }
@@ -167,6 +168,7 @@ export class WindowsPersonalWeChatAdapter implements PersonalWeChatAdapter {
             this.options.canonicalNames,
           ) };
       const incoming: IncomingMessage[] = [];
+      const batchContext = new Set<string>();
       for (const item of batch.messages) {
         const triggerPrefixes = resolveWechatPrefixes(
           this.options.dbConversations,
@@ -186,20 +188,33 @@ export class WindowsPersonalWeChatAdapter implements PersonalWeChatAdapter {
         ));
         if (!selected) continue;
         if (this.repository.hasIncoming('wechat', item.messageId)) continue;
+        const isMedia = item.kind === 'image' || item.kind === 'sticker';
+        const match = matchWechatPrefix(text, triggerPrefixes.filter(Boolean));
+        const triggered = !this.options.requirePrefix || triggerPrefixes.includes('') || Boolean(match?.body);
+        // An image has no trigger text. With prefixes required it is picked up by
+        // the next group mention; otherwise it can be a question on its own.
+        if (isMedia && (!this.options.mediaEnabled || !triggered)) continue;
         let contextMessageIds: string[] = [];
         let contextAttachments: Array<{ path: string; label: string }> = [];
         const mention = item.userId.endsWith('@chatroom')
           ? matchWechatPrefix(text, triggerPrefixes.filter((prefix) => prefix.startsWith('@')))
           : null;
         if (this.dbReader && mention && item.sortSeq && !parseCommand(mention.body)) {
-          const history = await this.dbReader.context(item.userId, item.sortSeq);
+          const history = await this.dbReader.context(item.userId, item.sortSeq).catch((error: unknown) => {
+            this.logger.warn({
+              component: 'wechat_db', event: 'context_unavailable', user_id: item.userId,
+              message_id: item.messageId, error: error instanceof Error ? error.message : String(error),
+            }, '群聊上下文读取失败，将继续处理本次提问');
+            return [];
+          });
           const unused = selectIncrementalWechatContext(
             history,
-            (messageId) => this.repository.wasWechatMessageSubmitted(item.userId, messageId),
+            (messageId) => batchContext.has(`${item.userId}:${messageId}`)
+              || this.repository.wasWechatMessageSubmitted(item.userId, messageId),
           );
           if (unused.length > 0) {
             contextMessageIds = unused.map((entry) => entry.messageId);
-            const resolvedMedia = await this.dbReader.resolveMedia(
+            const resolvedMedia = this.options.mediaEnabled ? await this.dbReader.resolveMedia(
               item.userId,
               unused,
             ).catch((error: unknown) => {
@@ -208,7 +223,7 @@ export class WindowsPersonalWeChatAdapter implements PersonalWeChatAdapter {
                 error: error instanceof Error ? error.message : String(error),
               }, '群聊上下文媒体解析失败，将使用文字占位');
               return [];
-            });
+            }) : [];
             const attachmentPathByMessage = new Map(
               resolvedMedia
                 .filter((entry) => Boolean(entry.attachmentPath))
@@ -233,7 +248,7 @@ export class WindowsPersonalWeChatAdapter implements PersonalWeChatAdapter {
               item.senderDisplayName ?? item.senderId ?? '提问者',
               unused.map((entry) => ({
                 messageId: entry.messageId,
-                speaker: senderNameByMessage.get(entry.messageId) ?? entry.senderId ?? '未知成员',
+                speaker: senderNameByMessage.get(entry.messageId) ?? entry.senderDisplayName ?? entry.senderId ?? '未知成员',
                 text: attachmentNumber.has(entry.messageId)
                   ? `${entry.text}（见附件 ${attachmentNumber.get(entry.messageId)}）`
                   : entry.text,
@@ -241,6 +256,17 @@ export class WindowsPersonalWeChatAdapter implements PersonalWeChatAdapter {
               this.options.requirePrefix,
             );
           }
+        }
+        if (this.dbReader && isMedia && this.options.mediaEnabled) {
+          const media = await this.dbReader.resolveMedia(item.userId, [item]).catch(() => []);
+          if (media[0]?.attachmentPath) {
+            contextAttachments = [{ path: media[0].attachmentPath, label: item.kind === 'sticker' ? '表情包' : '图片' }];
+            text = `${text}（见附件 1，请根据附件回应。）`;
+          } else text = `${text}（本地媒体暂不可用，无法查看内容。）`;
+        }
+        if (triggered && !parseCommand(match?.body ?? text)) {
+          batchContext.add(`${item.userId}:${item.messageId}`);
+          for (const id of contextMessageIds) batchContext.add(`${item.userId}:${id}`);
         }
         this.logger.info({
           component: 'wechat', event: 'incoming_text', user_id: item.userId, display_name: item.displayName,
@@ -258,10 +284,8 @@ export class WindowsPersonalWeChatAdapter implements PersonalWeChatAdapter {
           timestamp: item.timestamp || Date.now(),
           triggerPrefixes,
           attachments: contextAttachments,
+          contextMessageIds,
         });
-        if (contextMessageIds.length > 0 && this.repository.wasWechatMessageSubmitted(item.userId, item.messageId)) {
-          this.repository.markWechatContextSubmitted(item.userId, contextMessageIds);
-        }
       }
       // Commit the complete batch before advancing the Python reader's cursor.
       this.repository.saveInbox(incoming);

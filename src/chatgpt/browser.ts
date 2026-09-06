@@ -224,6 +224,7 @@ export class ChatGPTBrowser {
     fallbackPrompt: string,
     onUpdate: (text: string) => Promise<void>,
     signal?: AbortSignal,
+    attachmentPaths: readonly string[] = [],
   ): Promise<{ text: string; conversationUrl: string }> {
     await this.assertReady();
     const page = this.requirePage();
@@ -232,7 +233,9 @@ export class ChatGPTBrowser {
     // A failed task may never have reached the webpage. In that case the
     // regenerate control still belongs to an older question.
     if (previousPrompt.trim() !== fallbackPrompt.trim() || !(await regenerate.isVisible().catch(() => false))) {
-      return this.generate(fallbackPrompt, onUpdate, signal);
+      return attachmentPaths.length
+        ? this.generate(fallbackPrompt, onUpdate, signal, attachmentPaths)
+        : this.generate(fallbackPrompt, onUpdate, signal);
     }
     this.state = BrowserState.GENERATING;
     try {
@@ -277,13 +280,13 @@ export class ChatGPTBrowser {
     const page = this.requirePage();
     if (signal?.aborted) throw new ChatGPTGenerationStoppedError('generation stopped');
     const oldUserCount = await findUserMessages(page).count();
-    await this.uploadAttachments(attachmentPaths, signal);
     let submissionAttempted = false;
     try {
       if (await findStopButton(page).isVisible().catch(() => false)) throw new ChatGPTSendError('上一次生成尚未结束');
       const editor = findPromptEditor(page);
       await editor.waitFor({ state: 'visible', timeout: 15_000 });
       await editor.fill(text);
+      await this.uploadAttachments(attachmentPaths, signal);
       if (signal?.aborted) throw new ChatGPTGenerationStoppedError('generation stopped');
       const send = findSendButton(page);
       if (await send.isVisible().catch(() => false)) {
@@ -299,6 +302,10 @@ export class ChatGPTBrowser {
         { timeout: 10_000 },
       );
     } catch (error) {
+      if (!submissionAttempted && attachmentPaths.length) {
+        // Discard a partially uploaded draft before the next task uses this page.
+        await page.reload({ waitUntil: 'domcontentloaded', timeout: 15_000 }).catch(() => undefined);
+      }
       if (error instanceof ChatGPTGenerationStoppedError) throw error;
       if (submissionAttempted) {
         throw new ChatGPTSendUncertainError('ChatGPT 提交状态无法确认，问题可能已发送；未自动重发，请检查网页后再决定是否 /retry');
@@ -311,7 +318,16 @@ export class ChatGPTBrowser {
     if (paths.length === 0) return;
     if (paths.length > 10) throw new ChatGPTSendError('单次上下文图片不能超过 10 张');
     if (signal?.aborted) throw new ChatGPTGenerationStoppedError('generation stopped');
-    await Promise.all(paths.map((filePath) => fs.access(filePath)));
+    let total = 0;
+    for (const filePath of paths) {
+      const stat = await fs.stat(filePath);
+      if (!stat.isFile() || stat.size === 0 || stat.size > 20 * 1024 * 1024
+          || !/\.(png|jpe?g|webp)$/iu.test(filePath)) {
+        throw new ChatGPTSendError('附件必须是 20 MB 以内的 PNG、JPEG 或静态 WebP 图片');
+      }
+      total += stat.size;
+    }
+    if (total > 100 * 1024 * 1024) throw new ChatGPTSendError('单次附件总大小不能超过 100 MB');
     const page = this.requirePage();
     const input = findFileInput(page);
     if (await input.count()) {
@@ -319,14 +335,43 @@ export class ChatGPTBrowser {
     } else {
       const attach = findAttachButton(page);
       await attach.waitFor({ state: 'visible', timeout: 10_000 });
-      const chooserPromise = page.waitForEvent('filechooser', { timeout: 10_000 });
-      await attach.click();
-      const chooser = await chooserPromise;
+      const [chooser] = await Promise.all([
+        page.waitForEvent('filechooser', { timeout: 10_000 }),
+        (async () => {
+          await attach.click();
+          const upload = page.getByRole('menuitem', { name: /upload from computer|add photos|add files|上传文件|添加照片|添加文件|从电脑上传/i }).first();
+          if (await upload.isVisible().catch(() => false)) await upload.click();
+        })(),
+      ]);
       await chooser.setFiles([...paths]);
     }
-    // Attachment previews are rendered asynchronously and image-only previews do
-    // not consistently expose filenames. Wait for the draft to settle before send.
-    await page.waitForTimeout(1_000);
+    const deadline = Date.now() + Math.min(this.options.timeoutMs, 60_000);
+    // A file input merely starts an upload. Require a preview for every file,
+    // no progress indicator, and an enabled submit control before sending.
+    while (Date.now() < deadline) {
+      if (signal?.aborted) throw new ChatGPTGenerationStoppedError('generation stopped');
+      const status = await page.evaluate(() => {
+        const editor = document.querySelector('#prompt-textarea, [contenteditable="true"][data-placeholder], textarea');
+        const scope = editor?.closest('form') ?? editor?.closest('[data-type="unified-composer"]') ?? editor?.parentElement?.parentElement;
+        if (!scope) return { previews: 0, busy: true, error: '' };
+        const previews = new Set<Element>();
+        scope.querySelectorAll('button[aria-label], button[title], [role="button"][aria-label]').forEach(button => {
+          const label = button.getAttribute('aria-label') ?? button.getAttribute('title') ?? '';
+          if (button.getClientRects().length > 0 && /remove (file|attachment|image)|删除(文件|附件|图片)|移除(文件|附件|图片)/i.test(label)) previews.add(button);
+        });
+        // Some versions use a bare Remove button on each image preview.
+        if (previews.size === 0) scope.querySelectorAll('button[aria-label="Remove"], button[aria-label="移除"], button[aria-label="删除"]').forEach(button => {
+          if (button.getClientRects().length > 0) previews.add(button);
+        });
+        const busy = Array.from(scope.querySelectorAll('[role="progressbar"], [aria-busy="true"], [data-testid*="upload-progress"], .animate-spin')).some(element => element.getClientRects().length > 0);
+        const alerts = Array.from(document.querySelectorAll('[role="alert"]')).filter(element => element.getClientRects().length > 0).map(element => element.textContent ?? '').join(' ');
+        return { previews: previews.size, busy, error: /upload failed|unable to upload|file too large|上传失败|无法上传|文件过大|已达到.*上传/i.test(alerts) ? alerts : '' };
+      });
+      if (status.error) throw new ChatGPTSendError(`附件上传失败：${status.error.slice(0, 200)}`);
+      if (status.previews >= paths.length && !status.busy && await findSendButton(page).isEnabled().catch(() => false)) return;
+      await page.waitForTimeout(250);
+    }
+    throw new ChatGPTSendError('附件上传未就绪，已取消提交；请检查网络或 ChatGPT 上传额度');
   }
 
   private async refreshLoginState(): Promise<void> {

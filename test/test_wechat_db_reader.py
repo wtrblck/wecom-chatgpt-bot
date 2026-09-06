@@ -59,7 +59,7 @@ class FakeDatabase:
         raise AssertionError("Resource SenderName2Id must not be used for message shard sender ids")
 
     def _msg_type_name(self, kind):
-        return "文本" if kind == 1 else "图片"
+        return {1: "文本", 3: "图片", 47: "动画表情", 49: "文件/链接/卡片"}.get(kind, "未知")
 
     def _friendly_content(self, content, kind):
         return "[%s]" % kind
@@ -90,6 +90,45 @@ class ReaderTests(unittest.TestCase):
         self.state = pathlib.Path(self.temporary.name) / "watermarks.json"
         self.reader = Reader(self.db, self.state)
         self.reader.start(CONFIG)
+
+    def test_disabled_media_does_not_load_the_media_module(self):
+        with patch.object(reader_module, "load_upstream_media", side_effect=AssertionError("must stay lazy")):
+            restarted = Reader(self.db, self.state)
+            restarted.start(CONFIG)
+            self.assertEqual(restarted.resolve_media(GROUP, [{"kind": "image"}]), [])
+            self.assertIsNone(restarted.media)
+
+    def test_enabled_media_poll_and_context_use_shard_local_sender_identity(self):
+        enabled = Reader(self.db, self.state)
+        enabled.start(CONFIG, True)
+        self.db.add(1, kind=3)
+        self.db.add(2, kind=47, content='<msg><emoji md5="' + 'a' * 32 + '"/></msg>')
+        self.db.add(3, kind=3, sender=9)
+        self.db.add(4, content="wxid_fake:\nself message", sender=9)
+        messages = enabled.poll()["messages"]
+        self.assertEqual([item["kind"] for item in messages], ["image", "sticker", "image", "text"])
+        history = enabled.context(GROUP, 5)
+        self.assertEqual([item["kind"] for item in history], ["sticker", "image"])
+        self.assertEqual(history[0]["senderDisplayName"], "Friend")
+        self.assertEqual(history[0]["shard"], "message_0.db")
+
+    def test_context_selects_rows_before_question_across_all_shards(self):
+        self.db.add(1, seq=10, content="wxid_friend:\nolder", shard=self.db.shards[0])
+        self.db.add(2, seq=20, content="recent", shard=self.db.shards[1])
+        for i in range(3, 10):
+            self.db.add(i, seq=i * 10, content="after question")
+        history = self.reader.context(GROUP, 25, 2)
+        self.assertEqual([item["text"] for item in history], ["recent", "older"])
+        self.assertEqual([item["senderId"] for item in history], ["wxid_friend", "wxid_friend"])
+
+    def test_media_lookup_rejects_ambiguous_local_ids_and_wrong_message_identity(self):
+        self.db.add(1, seq=10, kind=3, shard=self.db.shards[0])
+        self.db.add(1, seq=10, kind=3, shard=self.db.shards[1])
+        raw = {"localId": 1, "sortSeq": 10, "messageId": hashlib.sha256((GROUP + "|1|10").encode()).hexdigest()[:32]}
+        self.assertIsNone(self.reader._media_row(GROUP, raw))
+        exact = self.reader._media_row(GROUP, dict(raw, shard=self.db.shards[1]))
+        self.assertEqual(exact["_shard"], self.db.shards[1])
+        self.assertIsNone(self.reader._media_row(GROUP, dict(raw, shard=self.db.shards[1], messageId="wrong")))
 
     def test_poll_replays_until_ack_and_does_not_write_watermark(self):
         before = self.state.read_bytes()
@@ -165,6 +204,13 @@ class ReaderTests(unittest.TestCase):
         self.db.set_sender(77, "wxid_new_member")
         self.assertEqual(self.reader.poll()["messages"][0]["senderId"], "wxid_new_member")
         self.assertTrue(self.reader.health()["ready"])
+
+    def test_context_skips_supported_history_with_unknown_sender_without_guessing(self):
+        self.db.add(1, kind=49, sender=77, content='<msg><appmsg><title>orphan card</title></appmsg></msg>')
+        self.db.add(2, kind=1, sender=2, content="known context")
+        history = self.reader.context(GROUP, 3)
+        self.assertEqual([item["text"] for item in history], ["known context"])
+        self.assertEqual([item["senderId"] for item in history], ["wxid_friend"])
 
     def test_group_sender_envelope_only_used_when_index_has_no_identity(self):
         self.db.add(1, sender=99, content="wxid_envelope:\nhello")

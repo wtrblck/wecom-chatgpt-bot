@@ -29,6 +29,22 @@ export class Repository {
       .all(limit) as { payload: string }[]).map((row) => JSON.parse(row.payload) as IncomingMessage);
   }
 
+  taskSource(msgid: string): IncomingMessage | undefined {
+    if (!msgid.startsWith('wechat:')) return undefined;
+    const row = this.db.prepare('SELECT payload FROM wechat_inbox WHERE message_id = ?')
+      .get(msgid.slice('wechat:'.length)) as { payload: string } | undefined;
+    return row ? JSON.parse(row.payload) as IncomingMessage : undefined;
+  }
+
+  updateInboxSource(message: IncomingMessage): void {
+    const original = this.taskSource(`wechat:${message.messageId}`);
+    if (!original) return;
+    // Keep the original trigger text: recovery must apply channel policy again.
+    this.db.prepare('UPDATE wechat_inbox SET payload = ? WHERE message_id = ?')
+      .run(JSON.stringify({ ...original, attachments: message.attachments,
+        contextMessageIds: message.contextMessageIds }), message.messageId);
+  }
+
   finishInbox(messageId: string): void {
     this.db.prepare('UPDATE wechat_inbox SET handled_at = ? WHERE message_id = ?').run(Date.now(), messageId);
   }

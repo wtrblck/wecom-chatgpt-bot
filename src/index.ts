@@ -63,6 +63,7 @@ async function main(): Promise<void> {
         readMode: config.wechatReadMode,
         dbPythonPath: config.wechatDbPythonPath,
         dbConversations: config.wechatConversations.filter((item) => item.enabled),
+        mediaEnabled: config.wechatMediaEnabled,
       }, repository, logger)
     : undefined;
   const router = new MessageRouter(browser, conversations, repository, queue, logger, {
@@ -82,9 +83,13 @@ async function main(): Promise<void> {
       wechat: async () => wechat?.healthCheck() ?? false,
     },
     systemPrompt: (message) => message.platform === 'wechat'
-      ? resolveWechatSystemPrompt(config.wechatConversations, message.userId, message.displayName, config.systemPrompt)
-      : config.systemPrompt,
+      ? resolveWechatSystemPrompt(config.wechatConversations, message.userId, message.displayName,
+        config.initialInstruction ? undefined : config.systemPrompt)
+      : config.initialInstruction ? undefined : config.systemPrompt,
+    initialInstruction: () => config.initialInstruction,
     replyFormat: () => ({ prefix: config.replyPrefix, suffix: config.replySuffix }),
+    conversationStyle: () => ({ enabled: config.styleEnabled, persona: config.persona, languageStyle: config.languageStyle }),
+    mediaEnabled: config.wechatMediaEnabled,
   });
   let shuttingDown = false;
   let shutdownPromise: Promise<void> | undefined;

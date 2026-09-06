@@ -64,7 +64,7 @@ describe('MessageRouter channel policy', () => {
       repository,
       queue,
       createLogger('silent'),
-      { logMessageContent: false },
+      { logMessageContent: false, mediaEnabled: true },
     );
     await router.handle({
       message: {

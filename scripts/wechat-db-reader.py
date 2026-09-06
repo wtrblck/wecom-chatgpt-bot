@@ -82,7 +82,7 @@ class DatabaseAccess:
             raise RuntimeError("%s: %s" % (name, reason))
         return candidates[0]
 
-    def messages(self, user_id: str, cursor: Dict[str, Any] | None, limit: int = PAGE_SIZE) -> List[Dict[str, Any]]:
+    def messages(self, user_id: str, cursor: Dict[str, Any] | None, limit: int = PAGE_SIZE, before_sort_seq: int | None = None) -> List[Dict[str, Any]]:
         table = "Msg_" + hashlib.md5(user_id.encode("utf-8")).hexdigest()
         # This identifier is generated, never interpolated from user input.
         for attempt in (0, 1):
@@ -95,6 +95,8 @@ class DatabaseAccess:
                             continue
                         if cursor is None:
                             where, params, order = "", (limit,), "DESC"
+                            if before_sort_seq is not None:
+                                where, params = "WHERE sort_seq < ?", (before_sort_seq, limit)
                         else:
                             seq, local_id, previous_shard = cursor_key(cursor)
                             where = "WHERE sort_seq > ? OR (sort_seq = ? AND (local_id > ? OR (local_id = ? AND ? > ?)))"
@@ -152,7 +154,8 @@ class Reader:
         self.access = DatabaseAccess(db) if db is not None else None
         self.watermark_file = watermark_file or WATERMARK_FILE
         self.media = None
-        self.sticker_cache_index: Optional[Dict[str, Any]] = None
+        self.media_enabled = False
+        self.local_media = None
         self.chats: Dict[str, str] = {}
         self.watermarks: Dict[str, Dict[str, Any]] = {}
         self.account: str | None = None
@@ -200,9 +203,12 @@ class Reader:
             os.fsync(output.fileno())
         os.replace(temporary, self.watermark_file)
 
-    def start(self, conversations: List[Any]) -> Dict[str, Any]:
+    def start(self, conversations: List[Any], media_enabled: bool = False) -> Dict[str, Any]:
+        if not isinstance(media_enabled, bool):
+            raise RuntimeError("mediaEnabled 必须为开关值")
         if self.started:
             return self.health()
+        self.media_enabled = media_enabled
         if not conversations:
             raise RuntimeError("WECHAT_DB_CONVERSATIONS 不能为空")
         if self.db is None:
@@ -224,14 +230,6 @@ class Reader:
         assert self.access is not None
         chats = {}
         watermarks = dict(self.watermarks)
-        assert self.db is not None
-        media_module = load_upstream_media()
-        media_dir = WORKDIR / "context-media"
-        media_dir.mkdir(parents=True, exist_ok=True)
-        self.media = media_module.MediaDownloader(self.db, save_dir=str(media_dir))
-        original_scan = self.media._scan_aes_key
-        self.media._scan_aes_key = lambda monitor=False, monitor_timeout=120.0: original_scan(
-            monitor=False, monitor_timeout=min(float(monitor_timeout), 10.0))
         for raw in conversations:
             if isinstance(raw, dict):
                 if raw.get("enabled") is False:
@@ -264,12 +262,20 @@ class Reader:
                 "pendingBatchId": self.pending["batchId"] if self.pending else None}
 
     def _incoming(self, user_id: str, display_name: str, row: Dict[str, Any],
-                  nicknames: Dict[str, str]) -> Dict[str, Any] | None:
+                  nicknames: Dict[str, str], include_context: bool = False,
+                  skip_unknown_sender: bool = False) -> Dict[str, Any] | None:
         assert self.access is not None
         message = self.access.decode(row)
         content = message.get("content")
-        if message.get("type") != "文本":
+        kind = {"文本": "text", "图片": "image", "动画表情": "sticker", "文件/链接/卡片": "link"}.get(message.get("type"))
+        if kind is None or (kind != "text" and not include_context and (not self.media_enabled or kind == "link")):
             return None
+        if kind == "image":
+            content = "[图片]"
+        elif kind == "sticker":
+            content = "[表情包]"
+        elif kind == "link":
+            content = self._describe_card(content if isinstance(content, str) else "")
         if not isinstance(content, str) or (
             content == "[文本]" and isinstance(row["message_content"], (bytes, bytearray))
         ):
@@ -283,6 +289,12 @@ class Reader:
                 sender_id = match.group(1)
         # Numeric sender ids are indexes, not a documented self marker.
         if not sender_id:
+            # Supplemental group context is best-effort. Some WeChat 4.x
+            # wrapper/card rows legitimately point at an empty Name2Id slot.
+            # Never guess their author, but do not let an unrelated historical
+            # row block a valid, attributable trigger message either.
+            if skip_unknown_sender:
+                return None
             raise RuntimeError("无法确认消息发送者，暂不推进水位；请检查消息分片 Name2Id 与微信数据库版本")
         if sender_id not in nicknames:
             nicknames[sender_id] = str(self.db.get_nickname(sender_id) or sender_id).strip()
@@ -294,7 +306,7 @@ class Reader:
                 "userId": user_id, "displayName": display_name, "senderId": sender_id,
                 "senderDisplayName": nicknames[sender_id] or sender_id, "text": content.strip(),
                 "timestamp": timestamp, "isSelf": sender_id == self.self_id,
-                "sortSeq": int(row["sort_seq"])}
+                "sortSeq": int(row["sort_seq"]), "kind": kind, "localId": int(row["local_id"]), "shard": row["_shard"]}
 
     def poll(self) -> Dict[str, Any]:
         if not self.started or self.access is None:
@@ -343,103 +355,88 @@ class Reader:
         return {"acknowledged": True}
 
     def context(self, user_id: str, before_sort_seq: int, scan_limit: int = 100) -> List[Dict[str, Any]]:
-        if self.db is None:
+        if not self.started or self.access is None:
             raise RuntimeError("微信数据库读取器尚未启动")
         if user_id not in self.chats or not user_id.endswith("@chatroom"):
             return []
-        output: List[Dict[str, Any]] = []
-        for message in self.db.get_messages(user_id, limit=max(10, min(int(scan_limit), 2000))):
-            seq = int(message.get("sort_seq") or 0)
-            if seq <= 0 or seq >= int(before_sort_seq):
-                continue
-            message_type = str(message.get("type") or "")
-            if message_type not in ("文本", "图片", "动画表情", "文件/链接/卡片"):
-                continue
-            if message.get("sender_id") in (2, "2"):
-                continue
-            content = message.get("content")
-            if not isinstance(content, str) or not content.strip():
-                continue
-            sender_username = str(message.get("sender_username") or "").strip()
-            body = content.strip()
-            first_line = body.split("\n", 1)[0].rstrip("\r")
-            if first_line.endswith(":") and " " not in first_line:
-                sender_username = first_line[:-1]
-                body = body.split("\n", 1)[1].strip() if "\n" in body else ""
-            if not body and message_type == "文本":
-                continue
-            local_id = int(message.get("local_id") or 0)
-            raw_id = "%s|%s|%s" % (user_id, local_id, seq)
-            timestamp = int(message.get("create_time") or 0)
-            if timestamp and timestamp < 10_000_000_000:
-                timestamp *= 1000
-            context_kind = "text"
-            if message_type == "图片":
-                context_kind = "image"
-                body = "[图片]"
-            elif message_type == "动画表情":
-                context_kind = "sticker"
-                body = "[表情包]"
-            elif message_type == "文件/链接/卡片":
-                context_kind = "link"
-                body = self._describe_card(body)
-            output.append({
-                "messageId": hashlib.sha256(raw_id.encode("utf-8")).hexdigest()[:32],
-                "userId": user_id,
-                "displayName": self.chats[user_id],
-                "senderId": sender_username or None,
-                "senderDisplayName": sender_username or "未知成员",
-                "text": body,
-                "kind": context_kind,
-                "localId": local_id,
-                "timestamp": timestamp,
-                "isSelf": False,
-                "sortSeq": seq,
-            })
+        # Use the same shard-local Name2Id mapping as polling, including for media.
+        rows = self.access.messages(user_id, None, limit=max(1, min(int(scan_limit), 200)),
+                                    before_sort_seq=int(before_sort_seq))
+        output, nicknames = [], {}
+        for row in rows:
+            item = self._incoming(user_id, self.chats[user_id], row, nicknames,
+                                  include_context=True, skip_unknown_sender=True)
+            if item and not item["isSelf"]:
+                if item["kind"] == "text":
+                    item["text"] = re.sub(r"^[^\s:\r\n]{1,128}:\r?\n", "", item["text"]).strip()
+                if item["text"]:
+                    output.append(item)
         return output
 
-    def resolve_media(self, user_id: str, messages: List[Any]) -> List[Dict[str, Any]]:
-        """只解析已经选入上下文的媒体，避免为大量历史消息扫描本地缓存。"""
-        if self.db is None:
-            raise RuntimeError("微信数据库读取器尚未启动")
-        if user_id not in self.chats or not user_id.endswith("@chatroom"):
-            return []
-        output: List[Dict[str, Any]] = []
-        nickname_cache: Dict[str, str] = {}
-        for raw in messages[:10]:
-            if not isinstance(raw, dict):
+    def _ensure_media(self) -> None:
+        if self.local_media is not None:
+            return
+        media_module = load_upstream_media()
+        media_dir = WORKDIR / "context-media"
+        media_dir.mkdir(parents=True, exist_ok=True)
+        self.media = media_module.MediaDownloader(self.db, save_dir=str(media_dir))
+        original_scan = self.media._scan_aes_key
+        self.media._scan_aes_key = lambda monitor=False, monitor_timeout=120.0: original_scan(
+            monitor=False, monitor_timeout=min(float(monitor_timeout), 5.0))
+        spec = importlib.util.spec_from_file_location("wechat_local_media", PROJECT_ROOT / "scripts" / "wechat-local-media.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.local_media = module.LocalMediaResolver(self.db, self.media, media_dir)
+
+    def _media_row(self, user_id: str, raw: Dict[str, Any]) -> Dict[str, Any] | None:
+        # local_id is only unique inside one shard. Refuse ambiguous older payloads.
+        table = "Msg_" + hashlib.md5(user_id.encode("utf-8")).hexdigest()
+        rows = []
+        for shard in self.db._message_dbs():
+            if raw.get("shard") and shard != raw["shard"]:
                 continue
-            message_id = str(raw.get("messageId") or "")
-            kind = str(raw.get("kind") or "")
-            local_id = int(raw.get("localId") or 0)
-            sender_id = str(raw.get("senderId") or "").strip()
-            if not message_id or local_id <= 0:
-                continue
-            if sender_id and sender_id not in nickname_cache:
-                nickname_cache[sender_id] = str(self.db.get_nickname(sender_id) or "").strip()
-            attachment_path = None
+            conn = self.db._open(shard)
             try:
-                if kind == "image":
-                    candidate = self.media.download_image(user_id, local_id) if self.media else None
-                    if candidate and pathlib.Path(candidate).suffix.lower() in (".jpg", ".jpeg", ".png", ".gif", ".webp"):
-                        attachment_path = str(pathlib.Path(candidate).resolve())
-                elif kind == "sticker":
-                    row = self.db.get_message_row(user_id, local_id)
-                    content = row.get("content") if isinstance(row, dict) else None
-                    if isinstance(content, str) and content.strip():
-                        body = content.strip()
-                        first_line = body.split("\n", 1)[0].rstrip("\r")
-                        if first_line.endswith(":") and " " not in first_line and "\n" in body:
-                            body = body.split("\n", 1)[1].strip()
-                        attachment_path = self._find_local_sticker(body, user_id, local_id)
-            except Exception:
-                attachment_path = None
-            resolved = {
-                "messageId": message_id,
-                "senderDisplayName": nickname_cache.get(sender_id) or sender_id or "未知成员",
-            }
-            if attachment_path:
-                resolved["attachmentPath"] = attachment_path
+                if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
+                    continue
+                for row in conn.execute("SELECT * FROM %s WHERE local_id=?" % table, (int(raw.get("localId") or 0),)):
+                    if raw.get("sortSeq") is not None and int(row["sort_seq"]) != int(raw["sortSeq"]):
+                        continue
+                    rows.append(dict(row, _shard=shard))
+            finally:
+                conn.close()
+        if len(rows) != 1:
+            return None
+        row = rows[0]
+        identity = "%s|%s|%s" % (user_id, row["local_id"], row["sort_seq"])
+        if hashlib.sha256(identity.encode()).hexdigest()[:32] != raw.get("messageId"):
+            return None
+        return row
+
+    def resolve_media(self, user_id: str, messages: List[Any]) -> List[Dict[str, Any]]:
+        if not self.media_enabled:
+            return []
+        if not self.started or self.db is None:
+            raise RuntimeError("微信数据库读取器尚未启动")
+        if user_id not in self.chats:
+            return []
+        output = []
+        for raw in messages[:10]:
+            if not isinstance(raw, dict) or raw.get("kind") not in ("image", "sticker"):
+                continue
+            resolved = {"messageId": str(raw.get("messageId") or ""),
+                        "senderDisplayName": str(self.db.get_nickname(raw.get("senderId") or "") or raw.get("senderId") or "未知成员")}
+            try:
+                row = self._media_row(user_id, raw)
+                expected = "图片" if raw["kind"] == "image" else "动画表情"
+                if row and self.db._msg_type_name(row["local_type"]) == expected:
+                    self._ensure_media()
+                    attachment = self.local_media.resolve(user_id, row, raw["kind"])
+                    if attachment:
+                        resolved["attachmentPath"] = attachment
+            except Exception as error:
+                # Do not lose a text batch because a cache file is locked or absent.
+                print("本地媒体不可用: %s" % type(error).__name__, file=sys.stderr)
             output.append(resolved)
         return output
 
@@ -460,96 +457,6 @@ class Reader:
             return "\n".join(parts)
         except (ET.ParseError, ValueError):
             return "[链接/卡片]"
-
-    def _find_local_sticker(self, content: str, user_id: str, local_id: int) -> Optional[str]:
-        try:
-            root = ET.fromstring(self._xml_body(content))
-            emoji = root.find(".//emoji")
-            if emoji is None:
-                return None
-            hashes = []
-            for name in ("md5", "androidmd5", "externmd5"):
-                value = emoji.attrib.get(name, "").strip().lower()
-                if len(value) == 32 and all(character in "0123456789abcdef" for character in value):
-                    hashes.append(value)
-            roots = [
-                pathlib.Path(self.db.account_dir) / "msg" / "emoji",
-                pathlib.Path(self.db.account_dir) / "msg" / "attach",
-                pathlib.Path(self.db.account_dir) / "business" / "emoticon",
-                pathlib.Path(self.db.account_dir) / "cache",
-            ]
-            for digest in hashes:
-                for search_root in roots:
-                    if not search_root.exists():
-                        continue
-                    for candidate in search_root.rglob("%s*" % digest):
-                        if not candidate.is_file() or candidate.stat().st_size > 15 * 1024 * 1024:
-                            continue
-                        data = candidate.read_bytes()
-                        extension = self._image_extension(data)
-                        if not extension and self.media:
-                            try:
-                                data = self.media.decrypt_image(str(candidate))
-                                extension = self._image_extension(data)
-                            except Exception:
-                                extension = None
-                        if not extension:
-                            continue
-                        destination = WORKDIR / "context-media" / ("%s_%s_sticker%s" % (user_id, local_id, extension))
-                        destination.write_bytes(data)
-                        return str(destination.resolve())
-            if self.sticker_cache_index is None:
-                self.sticker_cache_index = {}
-                cache_roots = [
-                    pathlib.Path(self.db.account_dir) / "business" / "emoticon",
-                    pathlib.Path(self.db.account_dir) / "cache",
-                ]
-                for cache_root in cache_roots:
-                    if not cache_root.exists():
-                        continue
-                    for candidate in cache_root.rglob("*"):
-                        if not candidate.is_file() or candidate.stat().st_size > 15 * 1024 * 1024:
-                            continue
-                        data = candidate.read_bytes()
-                        extension = self._image_extension(data)
-                        if not extension and self.media:
-                            try:
-                                data = self.media.decrypt_image(str(candidate))
-                                extension = self._image_extension(data)
-                            except Exception:
-                                extension = None
-                        if not extension:
-                            continue
-                        keys = {
-                            candidate.name.lower(),
-                            candidate.stem.lower(),
-                            hashlib.md5(data).hexdigest(),
-                        }
-                        for key in keys:
-                            self.sticker_cache_index[key] = (data, extension)
-            for digest in hashes:
-                cached = self.sticker_cache_index.get(digest)
-                if not cached:
-                    continue
-                data, extension = cached
-                destination = WORKDIR / "context-media" / ("%s_%s_sticker%s" % (user_id, local_id, extension))
-                destination.write_bytes(data)
-                return str(destination.resolve())
-            return None
-        except Exception:
-            return None
-
-    @staticmethod
-    def _image_extension(data: bytes) -> Optional[str]:
-        if data[:3] == b"\xff\xd8\xff":
-            return ".jpg"
-        if data[:4] == b"\x89PNG":
-            return ".png"
-        if data[:3] == b"GIF":
-            return ".gif"
-        if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
-            return ".webp"
-        return None
 
 
 def write(value: Dict[str, Any]) -> None:
@@ -575,7 +482,7 @@ def main() -> None:
                 if reader is None:
                     reader = Reader()
                 if operation == "start":
-                    result = reader.start(request.get("conversations", []))
+                    result = reader.start(request.get("conversations", []), request.get("mediaEnabled", False))
                 elif operation == "health":
                     result = reader.health()
                 elif operation == "poll":

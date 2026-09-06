@@ -43,7 +43,7 @@ export function findFileInput(page: Page): Locator {
 export function findAttachButton(page: Page): Locator {
   return page
     .getByRole('button', { name: /attach|add photos|upload|附件|上传|添加照片/i })
-    .or(page.locator('button[data-testid*="attach"], button[aria-label*="附件"], button[aria-label*="上传"]'))
+    .or(page.locator('button[data-testid="composer-plus-btn"], button[data-testid*="attach"], button[aria-label*="附件"], button[aria-label*="上传"]'))
     .filter({ visible: true })
     .first();
 }

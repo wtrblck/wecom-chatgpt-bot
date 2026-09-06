@@ -14,6 +14,7 @@ public partial class MainWindow
     private readonly TextBlock listenerHint = Txt("请先添加需要监听的会话", 12, color: "#78877F");
     private Button startButton = null!, stopButton = null!;
     private CheckBox onlyProblems = null!;
+    private string? renderedActivities;
     private FrameworkElement BuildDashboard()
     {
         var page = new StackPanel();
@@ -73,10 +74,14 @@ public partial class MainWindow
         checksList.Children.Clear();
         if (checks == null || checks.Count == 0) checksList.Children.Add(Txt("点击「检测环境」，检查配置、浏览器、\n微信窗口与读取依赖。", 12, color: "#78877F"));
         else foreach (var c in checks) { var ok = S(c?["status"]) == "ok"; var name = S(c?["name"]) switch { "configuration" => "监听配置", "chromium" => "GPT 浏览器", "reader" => "消息读取依赖", "wechat" => "微信登录", "controls" => "微信控件", _ => S(c?["name"]) }; var item = Txt((ok ? "✓   " : "!   ") + name + (ok ? "  ·  就绪" : "  ·  需要关注"), 12, color: ok ? "#4B7757" : "#AB8540", margin: new Thickness(0, 0, 0, 9)); item.ToolTip = S(c?["detail"]); checksList.Children.Add(item); }
+        var activitySignature = state["activities"]?.ToJsonString() + "|" + onlyProblems.IsChecked;
+        if (activitySignature != renderedActivities) {
+            renderedActivities = activitySignature;
         var activities = state["activities"]?.AsArray().Reverse().ToList() ?? [];
         recentList.Children.Clear(); foreach (var item in activities.Take(4)) recentList.Children.Add(LogRow(item));
         fullLog.Children.Clear(); foreach (var item in activities.Where(i => onlyProblems.IsChecked != true || S(i?["level"]) != "info")) fullLog.Children.Add(LogRow(item));
         if (fullLog.Children.Count == 0) fullLog.Children.Add(Txt("暂无符合筛选条件的记录", 12, color: "#78877F"));
+        }
         outboxList.Children.Clear();
         if (state["stats"]?["error"] != null) outboxList.Children.Add(Txt("读取任务记录失败：" + S(state["stats"]?["error"]), 12, color: "#B0523A"));
         else if (state["stats"]?["outbox"] is JsonArray outbox && outbox.Count > 0) foreach (var item in outbox) outboxList.Children.Add(Txt($"{S(item?["status"])}  ·  {S(item?["delivery_key"])}  ·  第 {S(item?["part"])} 片\n{S(item?["error"], "等待核对")}", 12, color: "#AB8540", margin: new Thickness(0, 0, 0, 12)));

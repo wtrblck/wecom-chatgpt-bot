@@ -30,6 +30,7 @@ public partial class MainWindow : Window
     internal MainWindow(string root, bool smoke)
     {
         this.root = root; this.smoke = smoke;
+        if (smoke) { Opacity = 0; ShowInTaskbar = false; }
         Title = "WeChatGPT · 微信智能对话工作台"; Width = 1320; Height = 900; MinWidth = 1120; MinHeight = 760;
         WindowStartupLocation = WindowStartupLocation.CenterScreen; Background = Brush("#F6F8F4");
         host = new HostClient(root);
@@ -43,7 +44,7 @@ public partial class MainWindow : Window
             if (closed) return; e.Cancel = true;
             if (closing) return;
             if (dirty && MessageBox.Show(this, "设置还没有保存。关闭后将丢弃这些修改，是否继续？", "未保存的修改", MessageBoxButton.OKCancel) != MessageBoxResult.OK) return;
-            closing = true; timer.Stop(); toast.Text = "正在安全停止机器人并关闭浏览器…";
+            closing = true; timer.Stop(); previewTimer.Stop(); toast.Text = "正在安全停止机器人并关闭浏览器…";
             try { await host.Close(); closed = true; Close(); }
             catch (Exception ex) { closing = false; toast.Text = ex.Message; timer.Start(); }
         };
@@ -61,10 +62,10 @@ public partial class MainWindow : Window
         var foot = new StackPanel(); foot.Children.Add(new Border { Background = Brush("#F2F7F1"), CornerRadius = new CornerRadius(10), Padding = new Thickness(14), Child = Stack(Txt("本地运行 · 由你掌控", 12, true), Txt("登录资料保留在本机\n仅监听你启用的会话", 11, color: "#78877F", margin: new Thickness(0, 8, 0, 0))) });
         foot.Children.Add(Txt("DESKTOP  /  v1.1.0", 10, color: "#9BA59D", margin: new Thickness(10, 20, 0, 0))); DockPanel.SetDock(foot, Dock.Bottom); side.Children.Add(foot);
         var links = new StackPanel();
-        string[] labels = ["◈    工作台", "☷    监听会话", "✧    回答风格", "≡    运行记录"];
+        string[] labels = ["◈    工作台", "☷    监听会话", "✧    人物与指令", "⚙    运行设置", "≡    运行记录"];
         for (var i = 0; i < labels.Length; i++) { var index = i; var button = Btn(labels[i], () => Navigate(index)); button.HorizontalContentAlignment = HorizontalAlignment.Left; button.Margin = new Thickness(0, 0, 0, 9); button.Padding = new Thickness(18, 14, 18, 14); button.BorderThickness = new Thickness(0); nav.Add(button); links.Children.Add(button); }
         links.Children.Add(Txt("工具与帮助", 10, color: "#9BA59D", margin: new Thickness(16, 28, 0, 12)));
-        links.Children.Add(Btn("↗    打开数据文件夹", () => OpenFolder(root)));
+        links.Children.Add(Btn("↗    打开数据文件夹", () => OpenFolder(Path.Combine(root, "data"))));
         links.Children.Add(Btn("?    使用与兼容性说明", () => OpenGuide(), margin: new Thickness(0, 10, 0, 0)));
         side.Children.Add(links); shell.Children.Add(sidebar);
         var main = new Grid { Margin = new Thickness(32, 27, 32, 20) }; Grid.SetColumn(main, 1);
@@ -73,7 +74,7 @@ public partial class MainWindow : Window
         var right = Stack(Txt(DateTime.Now.ToString("yyyy 年 M 月 d 日  ·  dddd"), 11, color: "#89958B"), new Border { Background = Brush("#EDF2EB"), CornerRadius = new CornerRadius(12), Padding = new Thickness(13, 6, 13, 6), Margin = new Thickness(0, 9, 0, 0), HorizontalAlignment = HorizontalAlignment.Right, Child = runtimeLabel });
         DockPanel.SetDock(right, Dock.Right); header.Children.Add(right);
         pageSubtitle.Margin = new Thickness(0, 8, 0, 0); header.Children.Add(Stack(pageTitle, pageSubtitle)); main.Children.Add(header);
-        pages.Add(BuildDashboard()); pages.Add(BuildConversations()); pages.Add(BuildStyle()); pages.Add(BuildActivity());
+        pages.Add(BuildDashboard()); pages.Add(BuildConversations()); pages.Add(BuildStyle()); pages.Add(BuildSettings()); pages.Add(BuildActivity());
         foreach (var page in pages) { page.Visibility = Visibility.Collapsed; pageArea.Children.Add(page); }
         Grid.SetRow(pageArea, 1); main.Children.Add(pageArea);
         var status = new Border { Background = Brush("#EBF0E8"), CornerRadius = new CornerRadius(7), Padding = new Thickness(13, 9, 13, 9), Margin = new Thickness(0, 15, 0, 0), Child = toast }; Grid.SetRow(status, 2); main.Children.Add(status);
@@ -82,8 +83,8 @@ public partial class MainWindow : Window
     private void Navigate(int index)
     {
         selectedPage = index;
-        string[] titles = ["工作台", "监听会话", "回答风格", "运行记录"];
-        string[] subs = ["连接微信与灵感，让回答自然发生。", "只回应你选择的群聊与联系人。", "给机器人一个清晰、稳定的表达方式。", "查看运行动态，及时处理需要关注的回复。"];
+        string[] titles = ["工作台", "监听会话", "人物与指令", "运行设置", "运行记录"];
+        string[] subs = ["连接微信与灵感，让回答自然发生。", "只回应你选择的群聊与联系人。", "管理人物设定、首次指令和可复用模板。", "管理媒体附件、消息读取与发送节奏。", "查看运行动态，及时处理需要关注的回复。"];
         pageTitle.Text = titles[index]; pageSubtitle.Text = subs[index];
         for (var i = 0; i < pages.Count; i++) { pages[i].Visibility = i == index ? Visibility.Visible : Visibility.Collapsed; nav[i].Background = Brush(i == index ? "#E8F1E8" : "#FFFFFF"); nav[i].Foreground = Brush(i == index ? "#22765A" : "#78877F"); nav[i].FontWeight = i == index ? FontWeights.SemiBold : FontWeights.Normal; }
     }
@@ -106,7 +107,7 @@ public partial class MainWindow : Window
             var result = await host.Call(method, parameters);
             toast.Text = method switch { "start" => "正在启动，运行状态和日志会持续更新。", "stop" => "机器人与登录浏览器已安全停止。", "login" => "请在打开的 GPT 浏览器中完成登录；状态将自动更新。", "diagnose" => "检测完成；控件检测仅代表当前聊天窗口的能力。", "save" => "设置已保存，下次启动生效。", "export" => "诊断报告已导出到 logs 文件夹。", _ => "操作完成。" };
             if (method == "save") { dirty = false; editingSettings = result?.DeepClone(); LoadEditors(); }
-            if (method == "newConversation") toast.Text = "已切换到新 GPT 对话。下一条问题会先设置风格，再发送消息正文。";
+            if (method == "newConversation") toast.Text = "已切换到新 GPT 对话。下一条问题会先发送已保存的首次指令。";
         } catch (Exception ex) { toast.Text = ex.Message; }
         finally { operating = false; foreach (var b in operationButtons) b.IsEnabled = true; await Refresh(); }
     }
@@ -121,14 +122,29 @@ public partial class MainWindow : Window
     {
         try {
             var directory = Path.Combine(root, ".cache", "desktop-smoke"); Directory.CreateDirectory(directory);
-            await Operate("diagnose", "正在执行只读环境检测…");
-            for (var i = 0; i < pages.Count; i++) {
-                Navigate(i); UpdateLayout(); await Task.Delay(220); await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.ApplicationIdle); UpdateLayout();
+            // Offline rendering only: never inspect WeChat or open ChatGPT.
+            var initialTemplate = instructionTemplateBox.Items.OfType<InstructionTemplateChoice>().FirstOrDefault(item => item.Id == "builtin-laoda");
+            if (initialTemplate == null) throw new Exception("默认劳大指令模板未加载");
+            instructionTemplateBox.SelectedItem = initialTemplate; UseInstructionTemplate();
+            if (!stylePreview.Text.Contains("姓名：劳大")) throw new Exception("默认劳大指令模板内容未正确加载");
+            personaBox.Text = "猫娘"; languageStyleBox.Text = "甜蜜、温柔、俏皮，使用自然中文";
+            replyPrefixBox.Text = "主人，"; replySuffixBox.Text = "喵～";
+            await RegenerateInstruction();
+            if (stylePreview.IsReadOnly || !stylePreview.Text.Contains("【人物设定】\n猫娘")) throw new Exception("首次指令编辑器未正确初始化");
+            if (instructionTemplateBox.Items.Count == 0) throw new Exception("默认指令模板未加载");
+            async Task Capture(int index, string filename) {
+                Navigate(index); UpdateLayout(); await Task.Delay(220); await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.ApplicationIdle); UpdateLayout();
                 var target = (FrameworkElement)Content;
                 var bitmap = new RenderTargetBitmap((int)target.ActualWidth, (int)target.ActualHeight, 96, 96, PixelFormats.Pbgra32); bitmap.Render(target);
                 var encoder = new PngBitmapEncoder(); encoder.Frames.Add(BitmapFrame.Create(bitmap));
-                using var file = File.Create(Path.Combine(directory, $"page-{i}.png")); encoder.Save(file);
+                using var file = File.Create(Path.Combine(directory, filename)); encoder.Save(file);
             }
+            for (var i = 0; i < pages.Count; i++) await Capture(i, $"page-{i}.png");
+            Width = MinWidth; Height = MinHeight;
+            await Capture(2, "page-2-compact.png");
+            styleEnabled.IsChecked = false; SchedulePreview(); await RefreshPreview();
+            if (instructionFields.IsEnabled) throw new Exception("风格关闭状态未正确应用");
+            await Capture(2, "page-2-disabled.png");
             if (state == null || editingSettings == null) throw new Exception("后端状态未加载");
             File.WriteAllText(Path.Combine(directory, "result.json"), new JsonObject { ["ok"] = true, ["pages"] = pages.Count, ["phase"] = state["phase"]?.ToString(), ["checks"] = state["checks"]?.DeepClone() }.ToJsonString());
         } catch (Exception ex) { File.WriteAllText(Path.Combine(root, ".cache", "desktop-smoke-error.txt"), ex.ToString()); Environment.ExitCode = 1; }

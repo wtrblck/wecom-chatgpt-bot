@@ -9,11 +9,21 @@ import { chromium } from 'playwright';
 import { ChatGPTBrowser } from '../chatgpt/browser.js';
 import { loadConfig } from '../config/config.js';
 import { loadWechatConversations } from '../config/wechat-conversations.js';
-import { readDesktopSettings, saveDesktopSettings, type DesktopSettings } from '../config/desktop-settings.js';
+import {
+  DEFAULT_INITIAL_INSTRUCTION,
+  DEFAULT_INSTRUCTION_TEMPLATE,
+  DEFAULT_LANGUAGE_STYLE,
+  DEFAULT_PERSONA,
+  readDesktopSettings,
+  saveDesktopSettings,
+  type DesktopSettings,
+} from '../config/desktop-settings.js';
 import { WeChatBridgeClient } from '../wechat/bridge-client.js';
 import { acquireProcessLock } from '../utils/process-lock.js';
 import { openDatabase } from '../db/sqlite.js';
 import { Repository } from '../conversation/repository.js';
+import { buildConversationInstructions } from '../core/reply-style.js';
+import { parseDesktopSettings } from '../config/desktop-settings.js';
 
 const execute = promisify(execFile);
 const detail = (error: unknown) => error instanceof Error ? error.message : String(error);
@@ -47,7 +57,17 @@ export class DesktopService {
     if (this.activities.length > 200) this.activities.shift();
   }
   settings(): DesktopSettings {
-    return readDesktopSettings(this.root) ?? {
+    const saved = readDesktopSettings(this.root);
+    if (saved) return saved;
+    const personaOverride = (process.env.REPLY_PERSONA || process.env.REPLY_ROLE || '').trim() || undefined;
+    const languageOverride = process.env.REPLY_LANGUAGE_STYLE?.trim() || undefined;
+    const hasLegacyStyleOverride = personaOverride !== undefined || languageOverride !== undefined;
+    return {
+      styleEnabled: process.env.REPLY_STYLE_ENABLED !== 'false', persona: personaOverride || DEFAULT_PERSONA,
+      languageStyle: languageOverride || DEFAULT_LANGUAGE_STYLE, mediaEnabled: process.env.WECHAT_MEDIA_ENABLED === 'true',
+      initialInstruction: hasLegacyStyleOverride ? '' : DEFAULT_INITIAL_INSTRUCTION,
+      selectedInstructionTemplateId: hasLegacyStyleOverride ? '' : DEFAULT_INSTRUCTION_TEMPLATE.id,
+      instructionTemplates: [DEFAULT_INSTRUCTION_TEMPLATE],
       systemPrompt: '', replyPrefix: '', replySuffix: '', requirePrefix: process.env.WECHAT_REQUIRE_PREFIX !== 'false', prefix: process.env.WECHAT_PREFIX || '/gpt',
       prefixAliases: [...new Set([...(process.env.WECHAT_PREFIX_ALIASES || '').split(',').map(a => a.trim()).filter(Boolean), '@ChatBOT', '@chatbot'])],
       pollIntervalMs: Number(process.env.WECHAT_POLL_INTERVAL_MS || 1000), sendIntervalMs: Number(process.env.WECHAT_SEND_INTERVAL_MS || 300),
@@ -94,6 +114,19 @@ export class DesktopService {
   }
   async action(method: string, value?: unknown): Promise<unknown> {
     if (method === 'state') return this.state();
+    if (method === 'previewStyle') {
+      const settings = parseDesktopSettings(value);
+      return { instructions: buildConversationInstructions(settings.initialInstruction ? undefined : settings.systemPrompt,
+        { prefix: settings.replyPrefix, suffix: settings.replySuffix },
+        { enabled: settings.styleEnabled, persona: settings.persona, languageStyle: settings.languageStyle },
+        settings.initialInstruction) };
+    }
+    if (method === 'composeInstruction') {
+      const settings = parseDesktopSettings(value);
+      return { instructions: buildConversationInstructions(settings.systemPrompt,
+        { prefix: settings.replyPrefix, suffix: settings.replySuffix },
+        { enabled: settings.styleEnabled, persona: settings.persona, languageStyle: settings.languageStyle }) };
+    }
     if (this.busy) throw new Error('上一项操作仍在进行，请稍候');
     this.busy = true;
     try {
@@ -161,7 +194,7 @@ export class DesktopService {
         } finally { db?.close(); release(); }
       }
     }
-    this.add('info', '已切换到新 GPT 对话；下一条问题将先初始化回复风格');
+    this.add('info', '已切换到新 GPT 对话；下一条问题会先发送已保存的首次指令');
     return { reset: true };
   }
 
@@ -170,12 +203,14 @@ export class DesktopService {
     const push = (name: string, ok: boolean, text: string) => checks.push({ name, status: ok ? 'ok' : 'error', detail: text });
     try { loadConfig(this.root); push('configuration', true, '监听对象和运行配置有效'); }
     catch (error) { push('configuration', false, detail(error)); }
-    push('chromium', fs.existsSync(chromium.executablePath()), fs.existsSync(chromium.executablePath()) ? 'Chromium 已安装；登录状态单独检测' : '缺少浏览器，请重新解压完整程序包');
+    push('chromium', fs.existsSync(chromium.executablePath()), fs.existsSync(chromium.executablePath()) ? 'Chromium 已安装；登录状态单独检测' : '缺少浏览器，请运行 npm run playwright:install');
     try {
       const python = path.resolve(this.root, process.env.WECHAT_DB_PYTHON_PATH || '.venv-wechatdb/Scripts/python.exe');
-      await execute(python, ['-c', 'import sqlite3, ctypes, cryptography, zstandard; from cryptography.hazmat.primitives.ciphers import Cipher; print("ready")'], { cwd: this.root, windowsHide: true, timeout: 15000 });
+      const imports = 'import sqlite3, ctypes, cryptography, zstandard; from cryptography.hazmat.primitives.ciphers import Cipher;'
+        + (this.settings().mediaEnabled ? ' import PIL;' : '') + ' print("ready")';
+      await execute(python, ['-c', imports], { cwd: this.root, windowsHide: true, timeout: 15000 });
       push('reader', true, '数据库读取依赖齐全；启动后验证实际连接');
-    } catch { push('reader', false, 'Python 读取依赖不可用，请重新解压完整程序包或运行项目 setup'); }
+    } catch { push('reader', false, 'Python 读取依赖不可用，请运行项目 setup；媒体功能需要 Pillow'); }
     const bridge = new WeChatBridgeClient(this.root, process.env.WECHAT_BRIDGE_PATH, this.logger);
     try {
       await bridge.start();

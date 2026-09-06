@@ -54,6 +54,7 @@ export class WeChatDbReaderClient {
     private readonly pythonPath: string,
     private readonly conversations: readonly WeChatConversationConfig[],
     private readonly logger: Logger,
+    private readonly mediaEnabled = false,
   ) {}
 
   async start(): Promise<void> {
@@ -95,7 +96,7 @@ export class WeChatDbReaderClient {
       this.failProcess(child, new Error(`微信数据库读取器已退出，code=${code ?? 'unknown'}，signal=${signal ?? 'none'}`));
     });
     try {
-      const health = await this.request<WeChatDbHealth>('start', { conversations: this.conversations }, 120_000);
+      const health = await this.request<WeChatDbHealth>('start', { conversations: this.conversations, mediaEnabled: this.mediaEnabled }, 120_000);
       if (!health?.ready) throw new Error('微信数据库读取器启动后未就绪');
     } catch (error) {
       this.failProcess(child, error);
@@ -151,8 +152,9 @@ export class WeChatDbReaderClient {
 
   resolveMedia(
     userId: string,
-    messages: readonly Pick<WeChatContextMessage, 'messageId' | 'localId' | 'kind' | 'senderId'>[],
+    messages: readonly Pick<BridgeIncomingMessage, 'messageId' | 'localId' | 'kind' | 'senderId' | 'sortSeq' | 'shard'>[],
   ): Promise<ResolvedWeChatMedia[]> {
+    if (!this.mediaEnabled) return Promise.resolve([]);
     return this.request('resolve_media', { userId, messages }, 60_000);
   }
 

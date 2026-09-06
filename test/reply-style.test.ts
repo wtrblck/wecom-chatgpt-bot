@@ -32,3 +32,20 @@ describe('web reply style and deterministic formatting', () => {
     expect(applyReplyFormat('', { prefix: '主人', suffix: '喵' })).toBe('');
   });
 });
+
+describe('modular style switches', () => {
+  it('builds only configured blocks and skips whitespace-only or disabled styles', () => {
+    expect(buildConversationInstructions('  ', { prefix: ' ' }, { role: ' ', languageStyle: '\n' })).toBeNull();
+    expect(buildConversationInstructions('legacy', { suffix: '喵' }, { enabled: false, role: '猫娘' })).toBeNull();
+    const instruction = buildConversationInstructions('', {}, { persona: '猫娘', languageStyle: '甜蜜' })!;
+    expect(instruction).toContain('【人物设定】\n猫娘');
+    expect(instruction).toContain('【语言风格】\n甜蜜');
+    expect(instruction).not.toContain('【固定前缀】');
+    expect(instruction).not.toContain('【补充要求】');
+  });
+  it('uses an editable initial instruction verbatim and appends only conversation-specific requirements', () => {
+    expect(buildConversationInstructions(undefined, {}, {}, '  我的自定义指令  ')).toBe('我的自定义指令');
+    expect(buildConversationInstructions('本群不要刷屏', {}, {}, '我的自定义指令')).toBe('我的自定义指令\n\n【会话补充要求】\n本群不要刷屏');
+    expect(buildConversationInstructions('补充', {}, { enabled: false }, '自定义')).toBeNull();
+  });
+});

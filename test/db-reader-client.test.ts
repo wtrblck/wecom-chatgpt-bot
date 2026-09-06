@@ -63,6 +63,13 @@ describe('WeChat database reader subprocess protocol', () => {
     vi.useRealTimers();
   });
 
+  it('sends the disabled default and never requests media resolution', async () => {
+    await client.start();
+    expect(child.requests[0]).toMatchObject({ mediaEnabled: false });
+    expect(await client.resolveMedia('room@chatroom', [])).toEqual([]);
+    expect(child.requests).toHaveLength(1);
+  });
+
   it('returns an unacknowledged batch and sends ack only when explicitly requested', async () => {
     const batch = await client.poll();
     expect(batch.messages).toEqual([message]);

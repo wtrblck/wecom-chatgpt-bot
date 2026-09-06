@@ -3,13 +3,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Repository } from '../src/conversation/repository.js';
 import { openDatabase } from '../src/db/sqlite.js';
 import type { BridgeIncomingMessage } from '../src/wechat/bridge-client.js';
-import { WindowsPersonalWeChatAdapter } from '../src/wechat/personal-wechat-adapter.js';
+import { WindowsPersonalWeChatAdapter, type PersonalWeChatAdapterOptions } from '../src/wechat/personal-wechat-adapter.js';
 import { splitWechatText } from '../src/wechat/text.js';
 import type { IncomingMessage } from '../src/types/index.js';
 
 const { bridge, reader, files } = vi.hoisted(() => ({
   bridge: { start: vi.fn(), stop: vi.fn(), health: vi.fn(), poll: vi.fn(), send: vi.fn(), snapshot: vi.fn() },
-  reader: { start: vi.fn(), stop: vi.fn(), health: vi.fn(), poll: vi.fn(), ack: vi.fn() },
+  reader: { start: vi.fn(), stop: vi.fn(), health: vi.fn(), poll: vi.fn(), ack: vi.fn(), context: vi.fn(), resolveMedia: vi.fn() },
   files: { mkdir: vi.fn(), appendFile: vi.fn() },
 }));
 
@@ -36,6 +36,7 @@ describe('personal WeChat durable adapter integration', () => {
   let db: ReturnType<typeof openDatabase>;
   let repository: Repository;
   let adapter: WindowsPersonalWeChatAdapter;
+  let adapterOptions: PersonalWeChatAdapterOptions;
   let callback: ReturnType<typeof vi.fn<(incoming: IncomingMessage) => Promise<void>>>;
 
   beforeEach(() => {
@@ -52,6 +53,7 @@ describe('personal WeChat durable adapter integration', () => {
     reader.health.mockResolvedValue({ ready: true, conversationCount: 2 });
     reader.poll.mockResolvedValue({ batchId: null, messages: [] });
     reader.ack.mockResolvedValue(undefined);
+    reader.context.mockResolvedValue([]); reader.resolveMedia.mockResolvedValue([]);
     files.mkdir.mockResolvedValue(undefined);
     files.appendFile.mockResolvedValue(undefined);
     db = openDatabase(':memory:');
@@ -59,7 +61,7 @@ describe('personal WeChat durable adapter integration', () => {
     repository.saveContact('wechat', room, 'Test group');
     repository.saveContact('wechat', otherRoom, 'Other group');
     callback = vi.fn(async (incoming: IncomingMessage) => { repository.claimIncoming('wechat', incoming.messageId); });
-    adapter = new WindowsPersonalWeChatAdapter({
+    adapterOptions = {
       projectRoot: process.cwd(), pollIntervalMs: 1_000, sendIntervalMs: 1,
       logDirectory: `${process.cwd()}/logs/test`, requirePrefix: true, prefixes: ['/gpt'],
       canonicalNames: [], readMode: 'db', dbPythonPath: 'unused-python',
@@ -68,7 +70,8 @@ describe('personal WeChat durable adapter integration', () => {
         { id: otherRoom, name: 'Other group', type: 'group', enabled: true },
         { id: 'disabled@chatroom', name: 'Disabled group', type: 'group', enabled: false },
       ],
-    }, repository, { info: vi.fn(), error: vi.fn(), debug: vi.fn() } as unknown as Logger);
+    };
+    adapter = new WindowsPersonalWeChatAdapter(adapterOptions, repository, { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } as unknown as Logger);
     adapter.onMessage(callback);
   });
 
@@ -83,6 +86,59 @@ describe('personal WeChat durable adapter integration', () => {
     await adapter.start();
     await vi.advanceTimersByTimeAsync(0);
   }
+
+  it('keeps media placeholders without resolving files by default', async () => {
+    const image = message({ messageId: 'image-1', kind: 'image', text: '[图片]', localId: 1, sortSeq: 1 });
+    reader.context.mockResolvedValue([image]);
+    reader.poll.mockResolvedValueOnce({ batchId: 'batch-media', messages: [message({ text: '@ChatBOT 看图', sortSeq: 2 })] });
+    adapterOptions.prefixes = ['@ChatBOT'];
+    await start();
+    expect(reader.resolveMedia).not.toHaveBeenCalled();
+    expect(callback.mock.calls[0]?.[0].text).toContain('[图片]');
+    expect(callback.mock.calls[0]?.[0].attachments).toEqual([]);
+  });
+  it('uploads a selected local image and avoids repeating context within one batch', async () => {
+    adapterOptions.mediaEnabled = true; adapterOptions.prefixes = ['@ChatBOT'];
+    const image = message({ messageId: 'image-1', kind: 'image', text: '[图片]', localId: 1, sortSeq: 1 });
+    reader.context.mockResolvedValue([image]);
+    reader.resolveMedia.mockResolvedValue([{ messageId: 'image-1', senderDisplayName: 'Friend', attachmentPath: 'cache/image.png' }]);
+    reader.poll.mockResolvedValueOnce({ batchId: 'batch-media', messages: [
+      message({ messageId: 'ask-1', text: '@ChatBOT 看图', sortSeq: 2 }),
+      message({ messageId: 'ask-2', text: '@ChatBOT 再说一句', sortSeq: 3 }),
+    ] });
+    await start();
+    expect(reader.resolveMedia).toHaveBeenCalledOnce();
+    expect(callback.mock.calls[0]?.[0].attachments).toEqual([{ path: 'cache/image.png', label: 'Friend发送的图片' }]);
+    expect(callback.mock.calls[0]?.[0].text).toContain('见附件 1');
+    expect(callback.mock.calls[1]?.[0].contextMessageIds).toEqual([]);
+  });
+  it('allows direct images only when media is enabled and no prefix is required', async () => {
+    adapterOptions.mediaEnabled = true; adapterOptions.requirePrefix = false;
+    reader.resolveMedia.mockResolvedValue([{ messageId: 'direct', senderDisplayName: 'Friend', attachmentPath: 'cache/image.png' }]);
+    reader.poll.mockResolvedValueOnce({ batchId: 'direct', messages: [message({ messageId: 'direct', kind: 'image', text: '[图片]', localId: 1, sortSeq: 1 })] });
+    await start();
+    expect(callback.mock.calls[0]?.[0].attachments).toEqual([{ path: 'cache/image.png', label: '图片' }]);
+    expect(reader.ack).toHaveBeenCalledWith('direct');
+  });
+  it('still dispatches text when local media resolution fails', async () => {
+    adapterOptions.mediaEnabled = true; adapterOptions.prefixes = ['@ChatBOT'];
+    reader.context.mockResolvedValue([message({ messageId: 'image-1', kind: 'image', text: '[图片]', sortSeq: 1 })]);
+    reader.resolveMedia.mockRejectedValue(new Error('locked cache'));
+    reader.poll.mockResolvedValueOnce({ batchId: 'locked', messages: [message({ text: '@ChatBOT 看图', sortSeq: 2 })] });
+    await start();
+    expect(callback).toHaveBeenCalledOnce();
+    expect(callback.mock.calls[0]?.[0].attachments).toEqual([]);
+    expect(reader.ack).toHaveBeenCalledWith('locked');
+  });
+  it('still acknowledges and dispatches a mention when optional context cannot be read', async () => {
+    adapterOptions.prefixes = ['@ChatBOT'];
+    reader.context.mockRejectedValue(new Error('unknown sender in historical card'));
+    reader.poll.mockResolvedValueOnce({ batchId: 'context-failed', messages: [message({ text: '@ChatBOT 继续说', sortSeq: 20 })] });
+    await start();
+    expect(callback).toHaveBeenCalledOnce();
+    expect(callback.mock.calls[0]?.[0]).toMatchObject({ text: '@ChatBOT 继续说', contextMessageIds: [] });
+    expect(reader.ack).toHaveBeenCalledWith('context-failed');
+  });
 
   it('does not acknowledge or dispatch when saving the inbox fails, then retries the batch', async () => {
     reader.poll.mockResolvedValue({ batchId: 'batch1', messages: [message()] });

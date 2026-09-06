@@ -26,6 +26,11 @@ function positiveInteger(name: string, fallback: number): number {
 }
 
 export interface Config {
+  styleEnabled?: boolean;
+  persona?: string;
+  languageStyle?: string;
+  initialInstruction?: string;
+  wechatMediaEnabled?: boolean;
   systemPrompt?: string;
   replyPrefix?: string;
   replySuffix?: string;
@@ -90,6 +95,11 @@ export function loadConfig(cwd = process.cwd()): Config {
     throw new Error('个人微信必须在 config/wechat-conversations.json 中明确配置至少一个监听会话');
   }
   return {
+    styleEnabled: desktop?.styleEnabled ?? booleanValue('REPLY_STYLE_ENABLED', true),
+    persona: desktop?.persona ?? (process.env.REPLY_PERSONA?.trim() || process.env.REPLY_ROLE?.trim()),
+    languageStyle: desktop?.languageStyle ?? process.env.REPLY_LANGUAGE_STYLE?.trim(),
+    initialInstruction: desktop?.initialInstruction,
+    wechatMediaEnabled: desktop?.mediaEnabled ?? booleanValue('WECHAT_MEDIA_ENABLED', false),
     systemPrompt: desktop?.systemPrompt,
     replyPrefix: desktop?.replyPrefix,
     replySuffix: desktop?.replySuffix,

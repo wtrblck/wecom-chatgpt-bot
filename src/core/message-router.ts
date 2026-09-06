@@ -10,14 +10,17 @@ import { conversationIdFromUrl } from '../utils/text.js';
 import type { IncomingMessage, TaskRecord } from '../types/index.js';
 import type { ReplySession } from './contracts.js';
 import type { ChannelHealthProvider, ChannelPolicy, RoutedMessage } from './contracts.js';
-import { applyReplyFormat, buildConversationInstructions, type ReplyFormat } from './reply-style.js';
+import { applyReplyFormat, buildConversationInstructions, type ConversationStyle, type ReplyFormat } from './reply-style.js';
 
 export interface MessageRouterOptions {
   logMessageContent: boolean;
   policies?: Partial<Record<'wecom' | 'wechat', ChannelPolicy>>;
   health?: Partial<Record<'wecom' | 'wechat', ChannelHealthProvider>>;
   systemPrompt?: (message: IncomingMessage) => string | undefined;
+  initialInstruction?: (message: IncomingMessage) => string | undefined;
   replyFormat?: (message: IncomingMessage) => ReplyFormat;
+  conversationStyle?: (message: IncomingMessage) => ConversationStyle;
+  mediaEnabled?: boolean;
   accepts?: (message: IncomingMessage) => boolean;
 }
 
@@ -148,10 +151,20 @@ export class MessageRouter {
     const taskId = restored?.id ?? this.repository.transaction(() => {
       // These writes are one transaction: no durable dedup marker without a task.
       this.repository.claimIncoming(message.platform, message.messageId);
+      if (message.platform === 'wechat') {
+        this.repository.updateInboxSource(message);
+        this.repository.markWechatContextSubmitted(message.userId, message.contextMessageIds ?? []);
+      }
       return this.repository.createTask(sourceMessageId, conversationKey, prompt);
     });
-    const replyFormat = { ...this.options.replyFormat?.(message) };
-    const instructions = buildConversationInstructions(this.options.systemPrompt?.(message), replyFormat);
+    const style = this.options.conversationStyle?.(message) ?? {};
+    const replyFormat = style.enabled === false ? {} : { ...this.options.replyFormat?.(message) };
+    const instructions = buildConversationInstructions(
+      this.options.systemPrompt?.(message), replyFormat, style, this.options.initialInstruction?.(message),
+    );
+    // Re-check the current switch when restoring persisted tasks after a restart.
+    const attachmentPaths = message.platform !== 'wechat' || this.options.mediaEnabled === true
+      ? message.attachments?.map(attachment => attachment.path) ?? [] : [];
     this.logger.debug({
       component: 'task', event: 'enqueued', platform: message.platform, userid: message.userId,
       message_id: message.messageId, task_id: taskId, retry: useRetry,
@@ -177,13 +190,15 @@ export class MessageRouter {
             this.logger.info({ component: 'task', event: 'conversation_initialized', task_id: taskId }, '新 GPT 对话已设置回复风格');
           }
           const result = useRetry && !initialize
-            ? await this.browser.retryLast(prompt, (text) => reply.update(text), signal)
-            : message.attachments?.length
+            ? attachmentPaths.length
+              ? await this.browser.retryLast(prompt, (text) => reply.update(text), signal, attachmentPaths)
+              : await this.browser.retryLast(prompt, (text) => reply.update(text), signal)
+            : attachmentPaths.length
               ? await this.browser.generate(
                   prompt,
                   (text) => reply.update(text),
                   signal,
-                  message.attachments.map((attachment) => attachment.path),
+                  attachmentPaths,
                 )
               : await this.browser.generate(prompt, (text) => reply.update(text), signal);
           this.conversations.save(conversationKey, result.conversationUrl);
@@ -274,7 +289,10 @@ export class MessageRouter {
         this.repository.claimIncoming(message.platform, message.messageId);
         return reply.finish('还没有可以重试的问题。');
       }
-      return this.enqueuePrompt(context, prompt, true);
+      const source = previous ? this.repository.taskSource(previous.msgid) : undefined;
+      return this.enqueuePrompt({ ...context, message: { ...message,
+        attachments: source?.attachments, contextMessageIds: source?.contextMessageIds,
+      } }, prompt, true);
     }
   }
 

@@ -49,6 +49,7 @@ export interface IncomingMessage {
   timestamp: number;
   triggerPrefixes?: readonly string[];
   attachments?: readonly IncomingAttachment[];
+  contextMessageIds?: readonly string[];
 }
 
 export interface IncomingAttachment {

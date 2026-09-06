@@ -8,6 +8,8 @@
   },
   "scripts": {
     "desktop:build": "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/package-desktop.ps1",
+    "desktop:verify": "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/desktop-dev.ps1 -SmokeTest",
+    "chatgpt:upload:verify": "node scripts/project-run.mjs tsx scripts/chatgpt-upload-verify.ts",
     "desktop:dev": "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/desktop-dev.ps1",
     "dev": "node scripts/project-run.mjs dev",
     "start": "node scripts/project-run.mjs start",

@@ -78,6 +78,14 @@ describe('MessageRouter durable recovery', () => {
     expect(sent[0]).toContain('一系列聊天');
     expect(sent.slice(1)).toEqual(['第一条消息', '第二条消息']);
   });
+  it('sends the selected editable instruction as the setup turn', async () => {
+    const f = fixture({ initialInstruction: () => '已保存的完整首次指令', systemPrompt: () => '本群补充要求' });
+    f.browser.generate.mockResolvedValueOnce({ text: '已了解', conversationUrl: 'https://chatgpt.com/c/custom' });
+    await f.router.handle({ message: message('custom-instruction', '真实问题'), reply: session() });
+    await waitForIdle(f.queue); await f.router.waitForDeliveries();
+    expect(f.browser.generate.mock.calls[0]?.[0]).toBe('已保存的完整首次指令\n\n【会话补充要求】\n本群补充要求');
+    expect(f.browser.generate.mock.calls[1]?.[0]).toBe('真实问题');
+  });
   it('prefix plus /new resets only its conversation and initializes the next question again', async () => {
     const f = fixture({ systemPrompt: () => '简洁回答', policies: { wechat: { requirePrefix: true, prefixes: ['/gpt', '@ChatBOT'] } } });
     f.repository.saveConversation('wechat:other', 'https://chatgpt.com/c/other');
@@ -382,4 +390,55 @@ describe('MessageRouter durable recovery', () => {
     expect(replyFor).not.toHaveBeenCalled();
     expect(f.browser.generate).not.toHaveBeenCalled();
   });
+});
+
+describe('style switch and durable attachments', () => {
+  it.each([{}, { conversationStyle: () => ({ enabled: false, role: '猫娘' }), systemPrompt: () => '甜蜜', replyFormat: () => ({ suffix: '喵' }) }])(
+    'skips the setup turn when empty or disabled', async options => {
+      const f = fixture(options); const reply = session();
+      await f.router.handle({ message: message(), reply });
+      await waitForIdle(f.queue); await f.router.waitForDeliveries();
+      expect(f.browser.generate).toHaveBeenCalledOnce();
+      expect(f.browser.generate.mock.calls[0]?.[0]).toBe('请介绍项目');
+      expect(reply.finish.mock.calls[0]?.[0]).toBe('已生成并保存的答案');
+    });
+  it('does not upload persisted attachments when the current media switch is off', async () => {
+    const f = fixture(); const incoming = { ...message(), attachments: [{ path: 'old-image.png', label: '图片' }] };
+    f.repository.saveInbox([incoming]);
+    f.repository.createTask('wechat:' + incoming.messageId, 'wechat:' + incoming.userId, incoming.text);
+    await f.router.restoreQueued(() => session());
+    await waitForIdle(f.queue); await f.router.waitForDeliveries();
+    expect(f.browser.generate.mock.calls[0]?.[3]).toBeUndefined();
+  });
+  it('keeps original attachments over repeated retries and initializes without files', async () => {
+    const f = fixture({ mediaEnabled: true, conversationStyle: () => ({ role: '猫娘', languageStyle: '甜蜜' }) });
+    const incoming = { ...message(), attachments: [{ path: 'original.png', label: '图片' }], contextMessageIds: ['context-1'] };
+    f.repository.saveInbox([incoming]);
+    f.browser.generate.mockResolvedValueOnce({ text: '明白', conversationUrl: 'https://chatgpt.com/c/group-a' })
+      .mockRejectedValueOnce(new Error('upload failed'));
+    await f.router.handle({ message: incoming, reply: session() });
+    await waitForIdle(f.queue); await f.router.waitForDeliveries();
+    expect(f.browser.generate.mock.calls[0]?.[3]).toBeUndefined();
+    expect(f.browser.generate.mock.calls[1]?.[3]).toEqual(['original.png']);
+    expect(f.repository.wasWechatMessageSubmitted(incoming.userId, 'context-1')).toBe(true);
+    for (const id of ['retry-one', 'retry-two']) {
+      const retry = message(id, '/retry'); f.repository.saveInbox([retry]);
+      await f.router.handle({ message: retry, reply: session() });
+      await waitForIdle(f.queue); await f.router.waitForDeliveries();
+      expect(f.browser.retryLast.mock.calls.at(-1)?.[3]).toEqual(['original.png']);
+    }
+  });
+});
+
+it('preserves the raw trigger in durable inbox payloads when attaching source metadata', async () => {
+  const f = fixture({ policies: { wechat: { requirePrefix: true, prefixes: ['/gpt'] } } });
+  const incoming = { ...message('trigger-preserved', '/gpt 看图'), contextMessageIds: ['context-1'] };
+  f.repository.saveInbox([incoming]);
+  await f.router.handle({ message: incoming, reply: session() });
+  await waitForIdle(f.queue); await f.router.waitForDeliveries();
+  expect(f.repository.taskSource('wechat:trigger-preserved')?.text).toBe('/gpt 看图');
+  f.db.prepare("UPDATE tasks SET status='queued' WHERE msgid=?").run('wechat:trigger-preserved');
+  await f.router.restoreQueued(() => session());
+  await waitForIdle(f.queue); await f.router.waitForDeliveries();
+  expect(f.browser.generate).toHaveBeenCalledTimes(2);
 });

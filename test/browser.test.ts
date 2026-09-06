@@ -1,5 +1,6 @@
+import fs from 'node:fs/promises';
 import type { Page } from 'playwright';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ChatGPTBrowser } from '../src/chatgpt/browser.js';
 import { ChatGPTGenerationStoppedError, ChatGPTGenerationTimeoutError, ChatGPTNavigationError, ChatGPTSendUncertainError } from '../src/chatgpt/errors.js';
 import * as selectors from '../src/chatgpt/selectors.js';
@@ -10,6 +11,7 @@ import { createLogger } from '../src/utils/logger.js';
 vi.mock('../src/chatgpt/selectors.js', () => ({
   findAssistantMessages: vi.fn(), findAuthenticatedUi: vi.fn(), findConversationUi: vi.fn(),
   findLoginControls: vi.fn(), findPromptEditor: vi.fn(), findRegenerateButton: vi.fn(),
+  findFileInput: vi.fn(), findAttachButton: vi.fn(),
   findSendButton: vi.fn(), findStopButton: vi.fn(), findUserMessages: vi.fn(),
 }));
 vi.mock('../src/chatgpt/response-watcher.js', () => ({ watchResponse: vi.fn() }));
@@ -23,6 +25,8 @@ function locator() {
     fill: vi.fn().mockResolvedValue(undefined),
     press: vi.fn().mockResolvedValue(undefined),
     waitFor: vi.fn().mockResolvedValue(undefined),
+    isEnabled: vi.fn().mockResolvedValue(true),
+    setInputFiles: vi.fn().mockResolvedValue(undefined),
     last: () => item,
   };
   return item;
@@ -51,6 +55,9 @@ function fixture(initialUrl = 'https://chatgpt.com/') {
     url: () => url,
     goto: vi.fn(async (target: string) => { url = target; }),
     waitForFunction: vi.fn().mockResolvedValue(undefined),
+    evaluate: vi.fn().mockResolvedValue({ previews: 1, busy: false, error: '' }),
+    waitForTimeout: vi.fn().mockResolvedValue(undefined),
+    reload: vi.fn().mockResolvedValue(undefined),
   };
   const browser = new ChatGPTBrowser({
     profilePath: 'unused', chatgptUrl: 'https://chatgpt.com/', headless: true,
@@ -59,7 +66,7 @@ function fixture(initialUrl = 'https://chatgpt.com/') {
   const internal = browser as unknown as {
     page: Page;
     assertReady(): Promise<void>;
-    sendMessage(text: string, signal?: AbortSignal): Promise<void>;
+    sendMessage(text: string, signal?: AbortSignal, paths?: readonly string[]): Promise<void>;
   };
   internal.page = page as unknown as Page;
   vi.spyOn(internal, 'assertReady').mockImplementation(async () => { browser.state = BrowserState.READY; });
@@ -151,5 +158,47 @@ describe('ChatGPT submission and conversation isolation', () => {
     await f.browser.retryLast('new question', async () => {});
     expect(generate).toHaveBeenCalledWith('new question', expect.any(Function), undefined);
     expect(f.regenerate.click).not.toHaveBeenCalled();
+  });
+});
+
+afterEach(() => vi.restoreAllMocks());
+describe('attachment upload boundaries', () => {
+  function mediaFixture() {
+    const f = fixture(); const input = locator(); input.count.mockResolvedValue(1);
+    vi.mocked(selectors.findFileInput).mockReturnValue(input as never);
+    vi.spyOn(fs, 'stat').mockResolvedValue({ size: 100, isFile: () => true } as never);
+    return { ...f, input };
+  }
+  it('waits for upload progress to clear before submitting once', async () => {
+    const f = mediaFixture();
+    f.page.evaluate.mockResolvedValueOnce({ previews: 1, busy: true, error: '' });
+    await f.internal.sendMessage('看图', undefined, ['image.png']);
+    expect(f.page.evaluate).toHaveBeenCalledTimes(2);
+    expect(f.send.click).toHaveBeenCalledOnce();
+    expect(f.page.waitForTimeout).toHaveBeenCalledWith(250);
+  });
+  it('refuses partial previews and discards the draft when readiness times out', async () => {
+    const f = mediaFixture();
+    vi.spyOn(Date, 'now').mockReturnValueOnce(0).mockReturnValue(61000);
+    await expect(f.internal.sendMessage('看图', undefined, ['image.png'])).rejects.toThrow('附件上传未就绪');
+    expect(f.send.click).not.toHaveBeenCalled(); expect(f.page.reload).toHaveBeenCalledOnce();
+  });
+  it('does not submit after an upload error or cancellation', async () => {
+    const f = mediaFixture(); f.page.evaluate.mockResolvedValue({ previews: 1, busy: false, error: '上传失败' });
+    await expect(f.internal.sendMessage('看图', undefined, ['image.png'])).rejects.toThrow('上传失败');
+    expect(f.send.click).not.toHaveBeenCalled();
+    const controller = new AbortController(); f.input.setInputFiles.mockImplementation(async () => { controller.abort(); });
+    await expect(f.internal.sendMessage('看图', controller.signal, ['image.png'])).rejects.toBeInstanceOf(ChatGPTGenerationStoppedError);
+    expect(f.send.click).not.toHaveBeenCalled();
+  });
+  it('rejects oversized or unsupported files before starting an upload', async () => {
+    const f = mediaFixture(); vi.mocked(fs.stat).mockResolvedValue({ size: 21 * 1024 * 1024, isFile: () => true } as never);
+    await expect(f.internal.sendMessage('看图', undefined, ['image.png'])).rejects.toThrow('20 MB');
+    expect(f.input.setInputFiles).not.toHaveBeenCalled();
+  });
+  it('includes original files when retry falls back to submitting the question', async () => {
+    const f = fixture(); const generate = vi.spyOn(f.browser, 'generate').mockResolvedValue({ text: 'answer', conversationUrl: 'https://chatgpt.com/c/test' });
+    await f.browser.retryLast('看图', async () => {}, undefined, ['original.png']);
+    expect(generate).toHaveBeenCalledWith('看图', expect.any(Function), undefined, ['original.png']);
   });
 });

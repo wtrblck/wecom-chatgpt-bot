@@ -4,7 +4,7 @@
       "name": "示例群聊",
       "type": "group",
       "id": "example_group_id@chatroom",
-      "enabled": true,
+      "enabled": false,
       "prefixes": ["/gpt", "@ChatBOT"],
       "systemPrompt": "请准确、简洁地回答问题。"
     },
@@ -12,7 +12,7 @@
       "name": "示例联系人",
       "type": "contact",
       "id": "wxid_example",
-      "enabled": true,
+      "enabled": false,
       "prefixes": ["/gpt", "@ChatBOT"],
       "systemPrompt": "请使用友好、清晰的语气回答。"
     }

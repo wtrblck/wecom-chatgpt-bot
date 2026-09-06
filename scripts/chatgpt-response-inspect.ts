@@ -2,13 +2,19 @@ import 'dotenv/config';
 import Database from 'better-sqlite3';
 import path from 'node:path';
 import { chromium } from 'playwright';
+import { acquireProcessLock } from '../src/utils/process-lock.js';
 
 const cwd = process.cwd();
-const db = new Database(path.resolve(cwd, process.env.DATABASE_PATH || './data/bot.sqlite'), { readonly: true });
+const taskId = Number(process.argv[2]);
+if (!Number.isSafeInteger(taskId) || taskId <= 0) throw new Error('Usage: node scripts/project-run.mjs tsx scripts/chatgpt-response-inspect.ts <taskId>');
+const databasePath = path.resolve(cwd, process.env.DATABASE_PATH || './data/bot.sqlite');
+const release = acquireProcessLock(databasePath);
+process.once('exit', release);
+const db = new Database(databasePath, { readonly: true });
 const row = db.prepare(`
-  SELECT chatgpt_url FROM conversations
-  WHERE userid = 'wechat:20663368641@chatroom'
-`).get() as { chatgpt_url?: string } | undefined;
+  SELECT c.chatgpt_url FROM conversations c JOIN tasks t ON t.userid=c.userid
+  WHERE t.id=?
+`).get(taskId) as { chatgpt_url?: string } | undefined;
 db.close();
 if (!row?.chatgpt_url) throw new Error('找不到群聊对应的 ChatGPT 会话 URL');
 
@@ -57,4 +63,5 @@ try {
   console.log(JSON.stringify(result, null, 2));
 } finally {
   await context.close();
+  release();
 }

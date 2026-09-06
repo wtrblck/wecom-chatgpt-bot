@@ -4,6 +4,6 @@ export interface PersonalWeChatAdapter {
   start(): Promise<void>;
   stop(): Promise<void>;
   onMessage(callback: (message: IncomingMessage) => Promise<void>): void;
-  sendText(userId: string, text: string): Promise<void>;
+  sendText(userId: string, text: string, deliveryKey?: string): Promise<void>;
   healthCheck(): Promise<boolean>;
 }

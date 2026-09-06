@@ -9,6 +9,7 @@ export class OutgoingQueue {
   private readonly jobs: OutgoingJob[] = [];
   private running = false;
   private closed = false;
+  private nextRunAt = 0;
 
   constructor(private readonly intervalMs: number) {}
 
@@ -35,6 +36,9 @@ export class OutgoingQueue {
     this.running = true;
     try {
       while (!this.closed && this.jobs.length > 0) {
+        const delay = this.nextRunAt - Date.now();
+        if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
+        if (this.closed) break;
         const job = this.jobs.shift();
         if (!job) continue;
         try {
@@ -42,8 +46,9 @@ export class OutgoingQueue {
           job.resolve();
         } catch (error) {
           job.reject(error);
+        } finally {
+          this.nextRunAt = Date.now() + this.intervalMs;
         }
-        if (this.jobs.length > 0) await new Promise((resolve) => setTimeout(resolve, this.intervalMs));
       }
     } finally {
       this.running = false;

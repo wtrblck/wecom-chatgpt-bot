@@ -1,138 +1,151 @@
-# 企业微信 + 个人微信 ChatGPT 网页机器人
+# 个人微信群 ↔ ChatGPT 网页机器人
 
-在 Windows 本机运行的双渠道机器人。企业微信使用官方 WebSocket SDK；普通个人微信通过本地只读数据库读取文本消息，并通过 Windows 官方微信 PC 客户端发送。两个渠道汇入同一个 MessageRouter，再用 Playwright 操作已登录的 ChatGPT 网页。项目不调用 OpenAI API 或 ChatGPT 私有接口。
+现在提供 Windows 桌面工作台：双击 release/WeChatGPT/WeChatGPT.exe，即可检测微信登录与控件兼容性、打开 GPT 登录、管理监听会话、设置全局与群聊提示词、查看运行日志和异常发送记录。支持 /gpt、@ChatBOT、@chatbot 及自定义别名。完整操作见 [桌面使用说明](docs/desktop-guide.md)。
 
-## 已实现
+桌面程序构建：npm run desktop:build（PowerShell 7、.NET 10 SDK）；便携包包含运行依赖，无需在目标电脑另装开发环境。项目内直接启动复用现有配置与登录资料；对外程序包不包含这些私人数据。
 
-- 企业微信单聊文本与 Markdown 流式回复
-- 一个持久化 Chromium Profile，人工登录一次后复用登录状态
-- 用户与 ChatGPT conversation URL 的 SQLite 持久映射
-- `msgid` 持久去重、任务审计和进程重启中断标记
-- 全局 FIFO 串行队列，避免同一个页面并发输入
-- UTF-8 字节级长度控制及超长回答主动分段
-- `/new`、`/retry`、`/stop`、`/status`、`/help`
-- 普通微信监听配置、联系人白名单和可选 `/gpt` 前缀
-- 可为每个普通微信联系人或群聊配置独立系统提示词
-- 普通微信单发送 worker、自然段长回复拆分和自身消息过滤
-- `wecom:userId` / `wechat:userId` 隔离的会话上下文
-- 浏览器崩溃最多恢复三次；DOM 异常保存截图、HTML 和 URL
-- 结构化日志与敏感字段脱敏，默认不记录问题和回答正文
+在 Windows 本机监听指定个人微信群，将文字发到已登录的 ChatGPT 网页，再把完整回答发回原群。保留 GPT 网页端；企业微信默认关闭，不再需要企业微信凭据。
 
-普通微信目前只处理私聊和群聊纯文本，不支持图片、文件、语音、好友请求、多账号和多浏览器并发；不注入 DLL，也不包含风控绕过。
+**本机已跑通个人微信群 → GPT 网页 → 原群的完整链路，无需鼠标发送。** 微信 4.1.13.12 显式启用可访问性后，由 UIA 定位目标与输入框，核验焦点后按 Enter。两次短回复从程序收到消息到客户端提交分别约 8.35 秒、10.46 秒，数据库均仅匹配一条；测试范围和数据核验见 [验证记录](docs/validation.md)。
 
-## 环境要求
+## 架构
 
-- Windows 10/11
-- Node.js 22 或更高版本
-- 企业微信智能机器人 Bot ID 与 Secret
-- Windows 官方微信 PC 客户端；普通微信渠道要求已人工登录并保持主窗口可用
-- .NET 9 Desktop Runtime/SDK（已发布桥接程序仅需要 Desktop Runtime）
-- 可正常登录 `https://chatgpt.com/` 的浏览器网络环境
+```mermaid
+flowchart LR
+  W[微信本地数据库] --> R[Python 增量读取]
+  R --> I[SQLite 收件箱]
+  I -->|持久化后 ack| R
+  I --> Q[持久任务 + GPT FIFO]
+  Q --> P[Playwright / GPT 网页]
+  P --> A[保存完整答案]
+  A --> O[分片发件箱]
+  O --> S[独立微信发送 worker]
+  S --> U[目标核验 / UIA 控件]
+  U --> G[原微信群]
+```
+
+读取、生成、发送分别推进。微信发送耗时时，网页可以开始下一条任务。同一 GPT 页面串行使用，各群用稳定群 ID 隔离 conversation URL；同一回答的多个片段由一个微信 worker 连续发送。
 
 ## 安装
 
-```powershell
-npm install
-npm run playwright:install
-Copy-Item .env.example .env
-Copy-Item config/wechat-conversations.example.json config/wechat-conversations.json
-```
+需要 Windows 10/11、Node.js 22+、Python 3.11+、.NET 10 SDK（运行已发布桥接只需 .NET 10 Desktop Runtime），以及已由本人登录的微信与可访问 ChatGPT 的网络。
 
-编辑 `.env` 并填写企业微信 Bot ID 与 Secret。Secret 只从环境变量读取；`.env`、浏览器 Profile、SQLite 数据库和错误页面快照都已排除在 Git 之外。
-
-## 启用普通个人微信
-
-先编译 Windows UI Automation 桥接程序：
+在项目文件夹运行：
 
 ```powershell
-npm run wechat:build
+npm run setup
 ```
 
-保持 Windows 官方微信已由用户本人登录，然后配置：
+安装脚本创建 `.venv-wechatdb`，安装锁定依赖，构建原生桥接，将 Chromium 下载至 `.cache/ms-playwright`，并在本地配置不存在时复制示例；不会覆盖已有配置，也不会启动 Bot。下载、临时文件、NuGet/npm/pip 缓存均留在项目内。
+
+编辑 `config/wechat-conversations.json`，删除示例 ID，填写真实群名。首次可省略 `id`，读取器会精确查找；存在重名则拒绝，需提供稳定 ID。发送仍依赖可区分的显示名，请为自动回复群使用唯一名称。
+
+```json
+{
+  "conversations": [
+    {
+      "name": "我的测试群",
+      "type": "group",
+      "id": "实际群ID@chatroom",
+      "enabled": true,
+      "systemPrompt": "请用中文简洁回答。"
+    }
+  ]
+}
+```
+
+`.env` 的默认配置：
 
 ```ini
+WECOM_ENABLED=false
 WECHAT_ENABLED=true
-WECHAT_ALLOWLIST=
-WECHAT_REQUIRE_PREFIX=false
-WECHAT_PREFIX=/gpt
-```
-
-程序会优先使用 `native/WeChatBridge/publish-v2/WeChatBridge.exe`，兼容回退到旧的 `publish/` 目录。若没有发布文件，会通过本机 `dotnet run` 启动源码桥。
-
-可先检查客户端状态：
-
-```powershell
-npm run wechat:probe
-```
-
-`windowFound: true` 且 `loggedIn: true` 表示桥接层已看到登录后的微信主窗口。
-
-首次联调可暂时保持白名单为空，但建议同时启用前缀模式。收到消息后，结构化日志会输出该联系人的本地 `wxui_...` ID（不会输出聊天正文），再将允许的 ID 写入：
-
-```ini
-WECHAT_ALLOWLIST=wxui_xxxxxxxxxxxxxxxxxxxxxxxx
+WECHAT_READ_MODE=db
+WECHAT_SEND_MODE=uia
+WECHAT_SEND_ACTION=enter
 WECHAT_REQUIRE_PREFIX=true
 WECHAT_PREFIX=/gpt
+WECHAT_PREFIX_ALIASES=@ChatBOT
+WECHAT_POLL_INTERVAL_MS=1000
+WECHAT_SEND_INTERVAL_MS=300
 ```
 
-此时只有白名单联系人发送 `/gpt 问题内容` 才会触发机器人；其他联系人不会收到自动回复。
+仅监听配置中启用的会话。默认 `/gpt 问题` 或 `@ChatBOT 问题` 才触发；要回复这些群内全部文字，可设 `WECHAT_REQUIRE_PREFIX=false`。`WECHAT_ALLOWLIST` 是额外的 ID 过滤。修改配置后重启。
 
-普通微信依赖官方客户端暴露的 Windows 可访问性元素。不同微信版本如果控件结构变化，操作会停止并将最小错误状态和窗口截图保存到 `logs/wechat/`。联系人 ID 优先来自客户端暴露的 AutomationId，否则由显示名生成并持久映射；显示名重复或改名时需要重新确认白名单 ID。
-
-## 第一次运行
+## 分阶段检查与运行
 
 ```powershell
-npm run dev
+npm run doctor
+npm run wechat:probe
+npm run wechat:inspect
 ```
 
-首次启动会打开 Chromium。若 ChatGPT 未登录，请只在这个窗口中人工完成登录；程序每两秒检测一次，成功后无需重启。后续启动会复用 `data/browser-profile`。
+`doctor` 检查配置、Python 依赖、浏览器文件和运行时，不读取聊天或发送消息。`probe` / `inspect` 只检查窗口；`inspect.sendCapabilities` 要有可读编辑器，使用 `invoke` 时还需要可调用的发送按钮。实际发送时仍须核验目标标题、草稿、前台窗口与编辑器焦点。
 
-生产运行：
+微信 4.x 如只显示 Qt 窗口外壳，先 `npm run wechat:accessibility:check`。确认需要启用后显式运行 `npm run wechat:accessibility:enable`，再 `npm run wechat:inspect`。启用工具会严格核验当前进程、DLL 哈希和唯一候选，再将内存中的可访问性标志置 1；不修改磁盘微信程序、不注入 DLL，不由 Bot 自动执行。微信重启后可能需要重做。详见 [helper](native/WeChatAccessibility/README.md)。
 
 ```powershell
 npm run build
 npm start
 ```
 
-## 微信监听与系统提示词
+停止时在另一个项目终端运行 `npm run stop`。它通过项目实例专属的本地控制通道发出请求，停止接收新消息、取消在途生成、等待发送收尾并关闭浏览器和数据库。Windows 终端的 Ctrl+C 或直接关闭窗口可能强制结束进程，正式运行请使用停止命令。`npm run dev` 的文件监视仅用于开发，不用于长期驻留。
 
-先从 `config/wechat-conversations.example.json` 复制本地配置，再编辑 `config/wechat-conversations.json`，即可增加、停用或修改监听对象，无需再修改程序代码。真实监听配置默认不会提交到 Git：
+首次在程序打开的 Chromium 中人工登录 ChatGPT，后续复用 `data/browser-profile`。只有配置好真实监听会话并解决控件可用性后才启动正式自动回复。
 
-```json
-{
-  "conversations": [
-    {
-      "name": "群聊或联系人显示名称",
-      "type": "group",
-      "id": "可选但推荐填写的稳定微信 ID",
-      "enabled": true,
-      "systemPrompt": "仅作用于这个会话的系统提示词"
-    }
-  ]
-}
-```
+`npm run chatgpt:smoke` **会在 GPT 网页发送 hello**；`npm run wechat:resend:task -- <任务ID>` **会实际发送微信消息**。这些命令不属于只读诊断。`WechatBOT.bat` 仍可用于构建后启动。
 
-`type` 只能是 `group` 或 `contact`。新增对象时可以暂时省略 `id`，程序会按准确名称查找；成功解析后建议补上稳定 ID。`enabled` 设为 `false` 即停止监听。`systemPrompt` 留空表示不注入提示词。修改文件后需要重启 Bot。
+## 可靠性与恢复
 
-由于 ChatGPT 网页没有 API 的 system 角色，程序会在每次实际问题前加入该会话的系统指令；任务数据库仍只记录原始问题，`/retry` 不会重复嵌套提示词。
+- DB 读取只在 Node 将整批文字写入 SQLite 收件箱后确认水位。未确认批次可重放；多分片、同序号分页使用复合游标。首次订阅跳过已有历史；重启续读已确认水位之后的消息。
+- 消息去重与任务创建在一个 SQLite 事务内完成。未生成的排队任务可以重启恢复；旧版本遗留、无法重建上下文的 queued 任务标记 aborted。
+- GPT 回答先落盘再发送。明确尚未发送的已保存答案可在重启时恢复；生成中断、网页提交不确定时不自动再次提问。
+- 每个回复片段记录 `pending / sending / sent / failed / uncertain`。`sent` 表示观察到客户端提交证据，不等于服务器或群成员已收到。重启时 `sending` 变为 `uncertain`，避免盲目重发。
+- `/retry` 优先补发上次失败但已保存的答案，不重新请求 GPT；已确认片段跳过。若上次成功，`/retry` 仍表示重新生成。群内还有排队、生成或发送任务时，会提示等待。
+- 桥接超时会结束该 worker，杜绝超时操作长时间留在队列中；提交边界后没有明确结果则记录未知。相同数据库的 Bot 和手动补发工具互斥。
 
-## 分阶段联调
-
-先独立验证 ChatGPT 网页自动化：
+未知发送结果需要先在微信中核对，再处理本地状态。先停止 Bot：
 
 ```powershell
-npm run chatgpt:smoke
+npm run wechat:outbox -- list
+# 已看到 task:42 的第 0 段：仅更新本地记录，不发送
+npm run wechat:outbox -- mark-sent task:42 0
+# 已确认该段没有发送：允许后续补发，不在此命令中发送
+npm run wechat:outbox -- retry task:42 0
+npm run wechat:resend:task -- 42
 ```
 
-它会等待人工登录，发送固定的 `hello`，并打印最终回复。随后启动完整 Bot，在企业微信中依次测试普通问题、多轮追问、连续消息、`/new`、`/retry`、`/stop`、`/status` 和长回答。
+命令同样遵守前缀设置，默认在群里发送 `/gpt /new` 开始新 GPT 会话、`/gpt /stop` 停止生成并取消排队任务、`/gpt /retry` 重试、`/gpt /status` 查看状态、`/gpt /help` 查看帮助。停止生成不能撤回已交给发送 worker 的回答。群回复中的 `@昵称` 当前是普通文本提示，不是微信原生提及。
 
-## 数据与排障
+## 发送方式
 
-- 会话及任务：`data/bot.sqlite`
-- ChatGPT 登录：`data/browser-profile/`
-- DOM 异常证据：`logs/debug/`
-- 普通微信 UI 自动化错误与截图：`logs/wechat/`
-- 所有 ChatGPT selector：`src/chatgpt/selectors.ts`
-- 普通微信 UI 定位：`native/WeChatBridge/Program.cs`
+`uia` 为默认：恢复并核验微信窗口、精确会话定位、标题核验、空草稿检查、输入读回、焦点核验、一次提交，再检查输入框清空。缺少控件、存在草稿或不能确认目标时停止。
 
-如果 ChatGPT 改版，优先根据 `logs/debug` 中的截图和 HTML 修改 selector 层。长期驻留时建议关闭 Windows 自动睡眠，并用 Windows 任务计划程序或 NSSM 设置开机启动与进程守护。
+`WECHAT_SEND_ACTION=enter` 与本机微信的发送键一致；若微信设置为 Ctrl+Enter，设为 `ctrl-enter`。`invoke` 只适用于实际支持按钮调用的客户端，本机实测不生效。每次只执行配置的一个动作，失败后不会尝试其他快捷键或鼠标。既有草稿默认不覆盖；冒烟工具的 `--resume-verified-draft` 仅用于人工核对未发送、内容完全一致后的诊断恢复。
+
+`legacy` 显式保留旧视觉/坐标发送，只用于兼容性排查。它仍依赖前台焦点、OCR、剪贴板，返回未验证回执；当前发件箱会记录 `uncertain` 并停止后续片段。**它不是推荐的长期运行方式。** `ocr` 读取也只作为旧模式保留，不具备 DB 模式的水位恢复保证。
+
+## 数据与测试
+
+| 内容 | 项目内位置 |
+| --- | --- |
+| 会话、任务、收发件箱 | `data/bot.sqlite` |
+| GPT 登录状态 | `data/browser-profile/` |
+| 微信数据库解密缓存、密钥、水位 | `data/wechat-db-cache/` |
+| Python 环境 | `.venv-wechatdb/` |
+| 浏览器、安装缓存、测试临时文件 | `.cache/` |
+| .NET CLI / NuGet | `.dotnet-home/`、`.nuget/` |
+| 桥接发布文件 | `native/WeChatBridge/publish/` |
+| 错误诊断 | `logs/`、`latest.log` |
+
+收件箱与任务数据库包含问题、回答正文；日志默认不记录正文，诊断截图/HTML 可能包含页面内容。这些本地文件均不提交 Git。数据库与缓存尚未做自动过期清理，长期运行需要安排备份与保留策略。
+
+```powershell
+npm run check
+npm test
+npm run test:python
+npm run build
+npm run wechat:build
+npm run wechat:accessibility:test
+```
+
+测试使用模拟微信、模拟浏览器和本地假数据库，不会向外发消息。架构取舍与 GitHub 资料见 [架构评估](docs/architecture-review.md)。

@@ -3,7 +3,7 @@ import type { IncomingMessage } from '../types/index.js';
 export interface ReplySession {
   begin(content?: string): Promise<void>;
   update(content: string): Promise<void>;
-  finish(content: string): Promise<void>;
+  finish(content: string, deliveryKey?: string): Promise<void>;
 }
 
 export interface RoutedMessage {

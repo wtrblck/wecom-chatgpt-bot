@@ -21,6 +21,7 @@ export function parseWechatConversations(value: unknown): WeChatConversationConf
     throw new Error('微信监听配置必须包含 conversations 数组');
   }
   const seen = new Set<string>();
+  const names = new Set<string>();
   return root.conversations.map((raw, index) => {
     if (!raw || typeof raw !== 'object') throw new Error(`conversations[${index}] 必须是对象`);
     const item = raw as Record<string, unknown>;
@@ -54,6 +55,8 @@ export function parseWechatConversations(value: unknown): WeChatConversationConf
     }
     const key = id || `${type}:${name}`;
     if (seen.has(key)) throw new Error(`微信监听配置存在重复会话: ${key}`);
+    if (item.enabled !== false && names.has(name)) throw new Error(`控件发送不能区分同名会话，请使用唯一群名或备注: ${name}`);
+    if (item.enabled !== false) names.add(name);
     seen.add(key);
     return {
       name,
@@ -92,9 +95,10 @@ export function resolveWechatSystemPrompt(
   conversations: readonly WeChatConversationConfig[],
   userId: string,
   displayName?: string,
+  globalPrompt?: string,
 ): string | undefined {
   const enabled = conversations.filter((item) => item.enabled);
   const matched = enabled.find((item) => item.id === userId)
-    ?? enabled.find((item) => item.name === displayName);
-  return matched?.systemPrompt;
+    ?? enabled.find((item) => !item.id && item.name === displayName);
+  return [globalPrompt?.trim(), matched?.systemPrompt].filter(Boolean).join('\n\n') || undefined;
 }

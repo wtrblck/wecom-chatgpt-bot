@@ -85,6 +85,8 @@ internal static class WeChatVision
         Func<AutomationElement, Bitmap> capture,
         Action<int, int> click)
     {
+        if (!string.Equals(Environment.GetEnvironmentVariable("WECHAT_SEND_MODE"), "legacy", StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("视觉坐标发送仅在 WECHAT_SEND_MODE=legacy 时可用");
         root = PrepareWindow(root);
         var rect = GetWindowBounds(root);
         if (rect.IsEmpty || rect.Width < 650 || rect.Height < 450)

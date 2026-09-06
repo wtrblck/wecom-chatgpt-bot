@@ -1,0 +1,41 @@
+{
+  "name": "wecom-chatgpt-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/src/index.js",
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "wechat:ocr:install": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-wechat-ocr.ps1",
+    "wechat:build": "dotnet publish native/WeChatBridge/WeChatBridge.csproj -c Release -r win-x64 --self-contained false -o native/WeChatBridge/publish-v24",
+    "wechat:probe": "tsc -p tsconfig.json && node dist/scripts/wechat-probe.js",
+    "wechat:inspect": "tsc -p tsconfig.json && node dist/scripts/wechat-inspect.js",
+    "wechat:ocr:inspect": "tsc -p tsconfig.json && node dist/scripts/wechat-ocr-inspect.js",
+    "wechat:select:inspect": "tsc -p tsconfig.json && node dist/scripts/wechat-select-inspect.js",
+    "wechat:resend:task": "tsc -p tsconfig.json && node dist/scripts/wechat-resend-task.js",
+    "wechat:poll": "tsc -p tsconfig.json && node dist/scripts/wechat-poll.js",
+    "wechat:snapshot": "tsc -p tsconfig.json && node dist/scripts/wechat-snapshot.js",
+    "chatgpt:smoke": "tsx scripts/chatgpt-smoke.ts",
+    "playwright:install": "playwright install chromium"
+  },
+  "dependencies": {
+    "@wecom/aibot-node-sdk": "^1.0.7",
+    "better-sqlite3": "^12.4.1",
+    "dotenv": "^17.2.2",
+    "pino": "^9.9.4",
+    "playwright": "^1.55.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^24.3.1",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  }
+}
